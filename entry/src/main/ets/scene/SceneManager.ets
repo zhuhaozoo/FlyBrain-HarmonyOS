@@ -99,8 +99,8 @@ export class SceneManager {
   // M4：一次性注册需要按名字访问的节点，并隐藏所有特效节点（事件期间才显示）
   private registerExtra(root: Node): void {
     const names: string[] = [
-      // 环境
-      'sun_pivot', 'sun', 'moon_pivot', 'moon', 'stars', 'river',
+      // 环境（注意是 sun_disc / moon_disc：'sun' 这个名字被平行光占用了）
+      'sun_pivot', 'sun_disc', 'moon_pivot', 'moon_disc', 'stars', 'river',
       // 树木（一级/二级摇摆驱动点）
       'trunk_0', 'trunk_1', 'trunk_2', 'crown_0', 'crown_1', 'crown_2',
       // 果蝇头部轴心（进食低头）

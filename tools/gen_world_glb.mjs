@@ -232,7 +232,9 @@ function makeTube(path, radii, seg = 10, capStart = true, capEnd = true) {
   return g;
 }
 
-// 平面着色：把索引网格展开为逐面顶点 + 面法线（低多边形岩石用它最好看）
+// 平面着色：把索引网格展开为逐面顶点 + 面法线（低多边形岩石用它最好看）。
+// 注意：必须同时 addVertex 与 addTri —— 只加顶点会导致 mesh 索引为空，
+// 引擎会静默丢弃该节点（曾因此白折腾一轮：岩石/鹅卵石全都没了）。
 function flatShade(g) {
   const out = new Geometry();
   for (let i = 0; i < g.indices.length; i += 3) {
@@ -240,11 +242,18 @@ function flatShade(g) {
     const a = [g.positions[ia * 3], g.positions[ia * 3 + 1], g.positions[ia * 3 + 2]];
     const b = [g.positions[ib * 3], g.positions[ib * 3 + 1], g.positions[ib * 3 + 2]];
     const c = [g.positions[ic * 3], g.positions[ic * 3 + 1], g.positions[ic * 3 + 2]];
-    const n = norm3(cross3([b[0] - a[0], b[1] - a[1], b[2] - a[2]],
-      [c[0] - a[0], c[1] - a[1], c[2] - a[2]]));
+    const cr = cross3([b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+      [c[0] - a[0], c[1] - a[1], c[2] - a[2]]);
+    // 跳过退化三角形（球的极点处三顶点重合）：既省面数，也避免产生零法线
+    if (Math.hypot(cr[0], cr[1], cr[2]) < 1e-12) {
+      continue;
+    }
+    const n = norm3(cr);
+    const base = out.vertCount();
     for (const p of [a, b, c]) {
       out.addVertex(p[0], p[1], p[2], n[0], n[1], n[2]);
     }
+    out.addTri(base, base + 1, base + 2);
   }
   return out;
 }
@@ -501,6 +510,12 @@ function addMesh(geometry, material) {
   return meshes.length - 1;
 }
 function addNode(node, top = false) {
+  // rotation 统一成 {x,y,z,w}：调用方可能直接传 [x,y,z,w] 数组，
+  // 而序列化是按 .x/.y/.z/.w 读的 —— 传数组会被写成 [null,null,null,null]（非法 glTF）
+  if (node.rotation && Array.isArray(node.rotation)) {
+    const r = node.rotation;
+    node.rotation = { x: r[0], y: r[1], z: r[2], w: r[3] };
+  }
   nodes.push(node);
   const idx = nodes.length - 1;
   if (top) topNodes.push(idx);
@@ -673,10 +688,12 @@ const TREE_SPECS = [
 {
   const sunMesh = addMesh(makeEllipsoid(0.55, 0.55, 0.55, 0, 0, 0, 12, 16), MAT_SUN);
   const moonMesh = addMesh(makeEllipsoid(0.40, 0.40, 0.40, 0, 0, 0, 12, 16), MAT_MOON);
-  // 圆盘替身：用小球而非平面圆盘，避免正/背面剔除导致某个角度看不见
-  const sun = addNode({ name: 'sun', mesh: sunMesh, translation: [9, 0, 0] });
+  // 圆盘替身：用小球而非平面圆盘，避免正/背面剔除导致某个角度看不见。
+  // 注意命名：不能叫 'sun' —— 运行时会用 createLight({name:'sun'}) 创建平行光，
+  // 同名会让按名字查找取到灯而不是这个球体。
+  const sun = addNode({ name: 'sun_disc', mesh: sunMesh, translation: [9, 0, 0] });
   addNode({ name: 'sun_pivot', children: [sun] }, true);
-  const moon = addNode({ name: 'moon', mesh: moonMesh, translation: [9, 0, 0] });
+  const moon = addNode({ name: 'moon_disc', mesh: moonMesh, translation: [9, 0, 0] });
   addNode({ name: 'moon_pivot', rotation: quatFromAxisAngle(0, 0, 1, Math.PI), children: [moon] }, true);
 }
 
@@ -1084,13 +1101,52 @@ mkdirSync(dirname(OUT_FILE), { recursive: true });
 writeFileSync(OUT_FILE, glb);
 
 // ---------- 自校验 ----------
+// 这份校验的意义：下面每一条都是真实踩过的坑。宁可生成脚本直接崩，
+// 也不要产出一个"看起来 OK、装到真机上才发现少了一半东西"的 glb。
 const check = JSON.parse(jsonChunk.toString('utf8'));
-let bufLen = check.buffers[0].byteLength;
+const bufLen = check.buffers[0].byteLength;
+
+// 1) bufferView 不得越界
 for (const a of check.accessors) {
   const v = check.bufferViews[a.bufferView];
   if (v.byteOffset + v.byteLength > bufLen) throw new Error('bufferView overflow');
 }
-// 节点树结构打印 + 必备节点名检查（运行时靠 DFS 按名字查找，名字写错会静默失效）
+
+// 2) 任何 accessor 的 count 都不能为 0（count=0 的索引 accessor 会让引擎静默丢弃该节点）
+for (let i = 0; i < check.accessors.length; i++) {
+  if (check.accessors[i].count <= 0) {
+    throw new Error(`accessor[${i}] 的 count=${check.accessors[i].count}，非法`);
+  }
+}
+
+// 3) 每个 mesh 都必须有非空索引与顶点（曾因 flatShade 忘记 addTri 而丢掉全部岩石/鹅卵石）
+for (let i = 0; i < check.meshes.length; i++) {
+  const prim = check.meshes[i].primitives[0];
+  const matName = check.materials[prim.material] ? check.materials[prim.material].name : '?';
+  const idxAcc = check.accessors[prim.indices];
+  const posAcc = check.accessors[prim.attributes.POSITION];
+  if (!idxAcc || idxAcc.count < 3) {
+    throw new Error(`mesh[${i}](${matName}) 索引为空：count=${idxAcc ? idxAcc.count : 'none'}`);
+  }
+  if (!posAcc || posAcc.count < 3) {
+    throw new Error(`mesh[${i}](${matName}) 顶点不足：count=${posAcc ? posAcc.count : 'none'}`);
+  }
+}
+
+// 4) 节点变换必须是有限数值（传四元数数组会被写成 [null,null,null,null] 这种非法值）
+for (const n of check.nodes) {
+  for (const key of ['translation', 'rotation', 'scale']) {
+    const v = n[key];
+    if (!v) continue;
+    for (const x of v) {
+      if (typeof x !== 'number' || !Number.isFinite(x)) {
+        throw new Error(`节点 ${n.name} 的 ${key} 含非法值: ${JSON.stringify(v)}`);
+      }
+    }
+  }
+}
+
+// 5) 必备节点名检查（运行时靠 DFS 按名字查找，名字写错会静默失效）
 // 这份清单 = 运行时契约：改模型时**不要**改这些名字，否则功能会无声失效
 const names = new Set(check.nodes.map((n) => n.name));
 const REQUIRED = [
@@ -1102,7 +1158,7 @@ const REQUIRED = [
   'tree_0', 'tree_1', 'tree_2', 'trunk_0', 'trunk_1', 'trunk_2',
   'crown_0', 'crown_1', 'crown_2', 'fruit_0', 'fruit_8',
   // 昼夜
-  'sun_pivot', 'sun', 'moon_pivot', 'moon', 'stars', 'star_0', 'star_29',
+  'sun_pivot', 'sun_disc', 'moon_pivot', 'moon_disc', 'stars', 'star_0', 'star_29',
   // 青蛙（tongue 伸缩、pupil 蓄力前移与眨眼）
   'frog', 'frog_body', 'frog_tongue', 'frog_eye_l', 'frog_eye_r',
   'frog_pupil_l', 'frog_pupil_r',
@@ -1117,20 +1173,35 @@ const REQUIRED = [
 const missing = REQUIRED.filter((n) => !names.has(n));
 if (missing.length > 0) throw new Error('缺少必备节点: ' + missing.join(', '));
 
-// 节点名必须唯一：运行时靠 DFS 按名字查找，重名会导致取到错误的节点
+// 6) 节点名必须唯一：重名会让按名字查找取到错误的节点
 const seen = new Map();
 for (const n of check.nodes) {
   if (seen.has(n.name)) throw new Error(`节点名重复: ${n.name}`);
   seen.set(n.name, true);
 }
-// 三角形总数（面数预算红线 < 8 万）
+
+// 7) 场景根节点必须全部有效且引用的节点都存在
+for (const idx of check.scenes[0].nodes) {
+  if (typeof idx !== 'number' || idx < 0 || idx >= check.nodes.length) {
+    throw new Error(`scene.nodes 引用了不存在的节点下标: ${idx}`);
+  }
+}
+if (check.scenes[0].nodes.length !== topNodes.length) {
+  throw new Error(`scene.nodes 数量(${check.scenes[0].nodes.length}) 与顶层节点登记数(${topNodes.length}) 不一致`);
+}
+
+// 8) 三角面数：上下限都要卡（只卡上限会漏掉"几何整体缺失"这种事故）
 let triTotal = 0;
 for (const m of check.meshes) {
-  const prim = m.primitives[0];
-  triTotal += check.accessors[prim.indices].count / 3;
+  triTotal += check.accessors[m.primitives[0].indices].count / 3;
 }
-const budget = 80000;
-if (triTotal > budget) throw new Error(`三角面 ${triTotal} 超出预算 ${budget}`);
+const TRI_MIN = 8000, TRI_MAX = 80000;
+if (triTotal < TRI_MIN) {
+  throw new Error(`三角面 ${triTotal} 低于下限 ${TRI_MIN}，可能有 mesh 缺少几何`);
+}
+if (triTotal > TRI_MAX) {
+  throw new Error(`三角面 ${triTotal} 超出预算 ${TRI_MAX}`);
+}
 
 console.log(`world.glb OK: ${glb.length} bytes, meshes=${check.meshes.length}, nodes=${check.nodes.length}, ` +
   `materials=${check.materials.length}, topNodes=${topNodes.length}, triangles=${triTotal}`);

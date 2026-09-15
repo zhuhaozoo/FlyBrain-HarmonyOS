@@ -157,11 +157,11 @@ export class EnvironmentController {
     if (moonPivot) {
       moonPivot.rotation = quatZ(moonAngle);
     }
-    const sun = this.getNode('sun');
+    const sun = this.getNode('sun_disc');
     if (sun) {
       sun.visible = Math.sin(angle) > -0.02;
     }
-    const moon = this.getNode('moon');
+    const moon = this.getNode('moon_disc');
     if (moon) {
       moon.visible = Math.sin(moonAngle) > -0.02;
     }

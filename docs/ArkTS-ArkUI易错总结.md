@@ -376,6 +376,73 @@ env.setDeathDim(dead);            // ✅ 不再出现第二次比较
 
 ---
 
+### 29. glb 生成脚本的自查「只卡上限」，漏掉了几何整体缺失 ⭐⭐
+
+**现象**：真机上 3D 场景加载失败（App 显示「3D 场景加载失败」），
+但 hilog 里既没有 `Scene init failed`，也没有引擎报错。只有：
+
+```
+[FlyBrain] root name='rootNode_' path=''
+[FlyBrain] tree: name='world' path='/rootNode_/'
+[FlyBrain] tree: name='stone_1' path='/rootNode_/world/'
+[FlyBrain] tree: name='stone_0' path='/rootNode_/world/'
+[FlyBrain] tree: name='ground_inner' path='/rootNode_/world/'
+[FlyBrain] tree: name='ground' path='/rootNode_/world/'
+[FlyBrain] nodes found: fly=false, wingL=false, wingR=false, food=0, spot=false, extra=1
+```
+
+`world` 节点下只有 4 个子节点，而 glb 的 `scenes[0].nodes` 里写着 61 个 ——
+**引擎把前 4 个场景根节点建完就静默停了**，剩下的 57 个连同它们的子树一个都没建。
+
+**根因**：几何生成脚本里的展开函数只写了顶点、忘了写索引：
+
+```js
+function flatShade(g) {
+  const out = new Geometry();
+  for (let i = 0; i < g.indices.length; i += 3) {
+    ...
+    for (const p of [a, b, c]) out.addVertex(p[0], p[1], p[2], n[0], n[1], n[2]);
+    // ❌ 少了 out.addTri(base, base + 1, base + 2);
+  }
+  return out;
+}
+```
+
+结果岩石与鹅卵石共 5 个 mesh 变成「有 324 个顶点、索引为空」。
+**索引 accessor 的 `count = 0` 是非法 glTF，引擎遇到它之后就不再继续建节点，而且是静默的。**
+
+**为什么自查没拦住**：脚本末尾的自查只有两条 —— 「bufferView 不越界」和
+「三角面数 **< 8 万（上限）**」。几何缺失时三角面总数只是**偏小**，照样通过，
+于是脚本还打印了 `world.glb OK ... triangles=12624`，实际少算了 5 个 mesh 的全部几何。
+
+**正确写法**：自查必须**上下限都卡**，并逐个 mesh 点名校验：
+
+```js
+// 逐个 mesh：索引与顶点都不能为空
+for (let i = 0; i < meshes.length; i++) {
+  const idxAcc = accessors[meshes[i].primitives[0].indices];
+  const posAcc = accessors[meshes[i].primitives[0].attributes.POSITION];
+  if (!idxAcc || idxAcc.count < 3) throw new Error(`mesh[${i}] 索引为空`);
+  if (!posAcc || posAcc.count < 3) throw new Error(`mesh[${i}] 顶点不足`);
+}
+// 任何 accessor 的 count 都不能为 0
+// 节点 translation/rotation/scale 必须是有限数值
+//   （传四元数数组、序列化代码却按 .x/.y/.z/.w 读 ⇒ 会写成 [null,null,null,null]，同样非法）
+// 三角面数下限
+if (triTotal < TRI_MIN) throw new Error(`三角面 ${triTotal} 低于下限，可能有 mesh 缺少几何`);
+```
+
+**判据**：资源生成脚本的自查，**只能证明「没超预算」，不能证明「东西都在」**。
+凡是"数量/规模"类指标，上下限都要卡；凡是应当存在的 mesh / 节点，都要**逐个点名**检查，
+不要用"总数看起来还行"来替代。
+
+> 排查手法备忘：把 glb 当成 zip 里的 JSON 读出来直接验证
+> （读 12 字节头 → JSON chunk 长度 → 解析 → 逐个 mesh 统计
+> `accessors[primitives[0].indices].count`），比在真机上反复试快得多。
+> 本次就是靠"某个 mesh 的 tris 列为 0"一眼定位的。
+
+---
+
 ## 三、官方 HDS 组件（UIDesignKit）坑
 
 ### 14. `HdsNavDestination` 必须配套 `HdsNavigation` 使用 ⭐
