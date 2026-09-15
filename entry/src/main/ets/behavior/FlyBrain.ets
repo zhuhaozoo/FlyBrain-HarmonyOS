@@ -63,8 +63,14 @@ export class FlyBrain {
     this.hp = cfg.hpStart;
     this.pose.yaw = Math.random() * TWO_PI;
     this.turnTimer = 0.5;
+    // 槽位 0..maxFoods-1：用户投喂；紧随其后 fruitCount 个：树上果实
     for (let i = 0; i < cfg.maxFoods; i++) {
       this.foods.push(new FoodItem());
+    }
+    for (let i = 0; i < cfg.fruitCount; i++) {
+      const f = new FoodItem();
+      f.kind = 1;
+      this.foods.push(f);
     }
   }
 
@@ -157,6 +163,30 @@ export class FlyBrain {
 
   getFoods(): FoodItem[] {
     return this.foods;
+  }
+
+  // 用户投喂槽位数量：foods[0..maxFoods-1] 是投喂，之后是树上果实
+  getUserFoodCount(): number {
+    return this.cfg.maxFoods;
+  }
+
+  // 页面在场景加载后把每个果实的水平位置与"挂果高度"告诉行为层（数据来自 glb 节点）
+  setFruitPosition(index: number, x: number, z: number, hangY: number): void {
+    const slot = this.cfg.maxFoods + index;
+    if (slot < 0 || slot >= this.foods.length) {
+      return;
+    }
+    const f = this.foods[slot];
+    f.x = x;
+    f.z = z;
+    f.hangY = hangY;
+    f.y = hangY;
+    f.kind = 1;
+    f.eaten = 0;
+    f.ready = false;
+    f.active = false;      // 未落地不可食
+    f.respawn = 0;
+    f.fallT = 0;
   }
 
   // 内驱力读取（UI 显示用）
@@ -311,10 +341,10 @@ export class FlyBrain {
   }
 
   // ---- 交互 ----
-  // 在场景坐标放一份食物（复用最旧的非活跃槽位）
+  // 在场景坐标放一份食物（复用最旧的非活跃用户槽位；不占用果实槽位）
   placeFood(x: number, z: number): void {
     let slot: FoodItem | null = null;
-    for (let i = 0; i < this.foods.length; i++) {
+    for (let i = 0; i < this.cfg.maxFoods && i < this.foods.length; i++) {
       if (!this.foods[i].active) {
         slot = this.foods[i];
         break;
@@ -327,9 +357,43 @@ export class FlyBrain {
     const k = r > this.cfg.arenaRadius ? this.cfg.arenaRadius / r : 1;
     slot.x = x * k;
     slot.z = z * k;
+    slot.y = this.cfg.fruitGroundY;
     slot.eaten = 0;
     slot.active = true;
+    slot.kind = 0;
     slot.dropT = 0;   // 触发"弹跳落地"（渲染层按 dropT 计算高度）
+  }
+
+  // 树上果实状态推进：吃光后倒计时重新结果 → 从树冠落下 → 落地变为可食
+  private updateFruits(dt: number): void {
+    for (let i = 0; i < this.foods.length; i++) {
+      const f = this.foods[i];
+      if (f.kind !== 1) {
+        continue;
+      }
+      if (f.respawn > 0) {
+        f.respawn -= dt;
+        if (f.respawn <= 0) {
+          f.respawn = 0;
+          f.eaten = 0;
+          f.ready = false;
+          f.active = false;
+          f.fallT = 0;
+          f.y = f.hangY;      // 重新挂到树冠上，开始下落
+        }
+        continue;
+      }
+      if (!f.ready && f.hangY > 0) {
+        f.fallT += dt;
+        const p = clamp(f.fallT / this.cfg.fruitFallTime, 0, 1);
+        f.y = f.hangY * (1 - p) + this.cfg.fruitGroundY * p;
+        if (p >= 1) {
+          f.y = this.cfg.fruitGroundY;
+          f.ready = true;
+          f.active = true;    // 落地后才成为觅食目标
+        }
+      }
+    }
   }
 
   // 光照档位：0 黑暗 / 0.5 昏暗 / 1 明亮
@@ -419,6 +483,7 @@ export class FlyBrain {
     }
     this.updateHp(dt);
     this.updateWaterProximity(dt);
+    this.updateFruits(dt);
   }
 
   // 生命值：饥饿耗尽持续掉血、落水重伤、光斑内晒太阳回血
@@ -642,6 +707,10 @@ export class FlyBrain {
     if (food.eaten >= 1) {
       // active=false 后 nearestFood 不再返回它，因此这里的回血与特效标记只会触发一次
       food.active = false;
+      food.ready = false;
+      if (food.kind === 1) {
+        food.respawn = this.cfg.fruitRespawn;   // 果实：过一会儿重新结果
+      }
       this.heal(this.cfg.hpEatGain);
       this.feedDoneFlag = true;
       // 轻量成就：连续吃完 3 份 → 「信任+1」

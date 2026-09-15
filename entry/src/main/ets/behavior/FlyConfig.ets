@@ -9,7 +9,10 @@ export class FlyConfig {
   public arenaRadius: number = 4.6;       // 活动半径（出界自动回转）
 
   // ---- 内驱力 ----
-  public hungerGain: number = 0.008;      // 饥饿累计/秒
+  // 注意：M1 定 0.008/s 时还没有 HP，饿了只是去找吃的、无害；
+  // M4 加入"饥饿满值持续掉血"后，这个速率会让果蝇 1 分钟就到顶、不到 2 分钟饿死。
+  // 因此调慢到 0.0025/s（约 3 分钟到顶），再由树上果实提供自主食物来源。
+  public hungerGain: number = 0.0025;     // 饥饿累计/秒
   public fearDecay: number = 0.10;        // 恐惧衰减/秒
   public fatigueGain: number = 0.010;     // 疲劳累计/秒（活动时，fly-logic 语义）
   public fatigueFlyGain: number = 0.020;  // 飞行时疲劳累计/秒
@@ -29,12 +32,18 @@ export class FlyConfig {
   public braceWindMax: number = 0.5;      // 风力低于此值→趴伏，否则惊吓
 
   // ---- 进食 / 觅食 ----
-  public maxFoods: number = 5;            // 场上最多食物数
+  public maxFoods: number = 5;            // 场上最多用户投喂食物数
   public eatDuration: number = 4;         // 吃完一份食物的秒数
   public hungerSeek: number = 0.45;       // 饥饿超过此值且场上有食物→觅食
   public hungerStop: number = 0.15;       // 饥饿低于此值停止进食
   public seekTimeout: number = 14;        // 觅食超时（秒）
   public eatRadius: number = 0.38;        // 到食物多近算吃到
+
+  // ---- M4.1：树上果实（果蝇的自主食物来源，让它能自持而不是等人投喂）----
+  public fruitCount: number = 9;          // 3 棵树 × 3 颗
+  public fruitRespawn: number = 60;       // 被吃后多久重新结果（秒）
+  public fruitFallTime: number = 0.9;     // 从树冠落到地面的时间（秒）
+  public fruitGroundY: number = 0.07;     // 落地后的高度
 
   // ---- 趋光 ----
   public phototaxisLight: number = 0.5;   // 光照超过此值才趋光（fly-logic）
@@ -109,6 +118,13 @@ export class FlyConfig {
   public skyNight: string = '#0B1026';
   public skyDawn: string = '#8FA6D8';
   public sunOrbitRadius: number = 9;
+
+  // 天空穹顶分段（**必须与 tools/gen_world_glb.mjs 的 SKY_PHASES / SKY_HEX 一致**）：
+  // 相位落在 [skyPhases[i], skyPhases[i+1]) 时显示 sky_i。
+  // 之所以用"多个预置穹顶 + 切换可见"而非单个穹顶运行时改色：
+  // camera.clearColor 在真机不生效，而运行时改材质要走 MaterialProperty、写入口径不确定。
+  public skyPhases: number[] = [0, 0.06, 0.12, 0.45, 0.60, 0.66, 0.70, 0.74, 0.90, 1.0];
+  public skyDomeCount: number = 9;
 
   // ---- M4：青蛙 ----
   public frogGuardRadius: number = 2.2;   // 警戒圈半径

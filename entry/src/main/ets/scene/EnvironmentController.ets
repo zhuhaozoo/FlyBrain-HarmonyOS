@@ -14,16 +14,16 @@ const DEG = Math.PI / 180;
 // 昼夜关键帧（相位 0..1，0 = 日出）。关键帧之间线性插值。
 // 时段占比：黎明 12% → 白天 50% → 黄昏 12% → 夜晚 26%
 const PHASES: number[] = [0.00, 0.12, 0.62, 0.68, 0.74, 0.90, 1.00];
-// 天空色（clearColor）
-const SKY_R: number[] = [0.56, 0.53, 0.53, 1.00, 0.043, 0.043, 0.56];
-const SKY_G: number[] = [0.65, 0.81, 0.81, 0.60, 0.063, 0.063, 0.65];
-const SKY_B: number[] = [0.85, 0.92, 0.92, 0.35, 0.149, 0.149, 0.85];
 // 平行光强度（倍率，相对基准强度）
 const SUN_I: number[] = [0.40, 1.00, 1.00, 0.50, 0.15, 0.18, 0.40];
 // 平行光颜色
 const SUN_R: number[] = [1.00, 1.00, 1.00, 1.00, 0.55, 0.55, 1.00];
 const SUN_G: number[] = [0.85, 0.97, 0.97, 0.70, 0.65, 0.65, 0.85];
 const SUN_B: number[] = [0.70, 0.90, 0.90, 0.45, 0.95, 0.95, 0.70];
+
+// 天空色不再由本类维护：改由预置的 9 段天空穹顶（glb 里的 sky_0..sky_8）按相位切换可见，
+// 见 FlyConfig.skyPhases 与 tools/gen_world_glb.mjs 的 SKY_PHASES/SKY_HEX。
+// 原因：camera.clearColor 在真机不生效，且运行时改材质色要经过 MaterialProperty、口径不确定。
 
 // 白天结束（日落）相位：日出→日落恰好扫过 180°，之后继续走完另外 180°（地平线以下）
 const LIT_FRAC = 0.74;
@@ -67,6 +67,11 @@ export class EnvironmentController {
   attach(light: Light | null, camera: Camera | null): void {
     this.light = light;
     this.camera = camera;
+    // 天空由 sky_* 穹顶承担；clearColor 仅作穹顶缺失时的兜底底色
+    // （真机上 clearColor 通常不生效，所以不能依赖它）。这里填夜空 #0B1026 的线性值。
+    if (camera) {
+      camera.clearColor = { r: 0.0034, g: 0.0059, b: 0.0194, a: 1.0 };
+    }
   }
 
   // 一次性注入按名字缓存的场景节点（页面从 SceneManager 取）
@@ -112,18 +117,37 @@ export class EnvironmentController {
     }
 
     this.updateSegment();
-    this.applySkyAndLight();
+    this.applySky();
+    this.applyLight();
     this.applySunMoonStars();
     this.applyTrees(windStrength);
     this.applyWaterAndFx(dt, windStrength);
   }
 
-  // 天空色 + 平行光强度/颜色（单一写入者：其它地方不要再直接改 light.intensity）
-  private applySkyAndLight(): void {
-    const sky = this.sample(SKY_R, SKY_G, SKY_B);
-    if (this.camera) {
-      this.camera.clearColor = { r: sky[0], g: sky[1], b: sky[2], a: 1.0 };
+  // 天空：按时段切换预置穹顶的可见性（同一时刻只有 1 个可见，绘制开销可忽略）
+  private applySky(): void {
+    const idx = this.skyIndex();
+    for (let i = 0; i < this.cfg.skyDomeCount; i++) {
+      const n = this.getNode(`sky_${i}`);
+      if (n) {
+        n.visible = (i === idx);
+      }
     }
+  }
+
+  // 当前相位落在哪一段天空（与生成脚本的 SKY_PHASES 一致）
+  private skyIndex(): number {
+    const phases = this.cfg.skyPhases;
+    for (let i = 0; i < phases.length - 1; i++) {
+      if (this.t >= phases[i] && this.t < phases[i + 1]) {
+        return Math.min(i, this.cfg.skyDomeCount - 1);
+      }
+    }
+    return this.cfg.skyDomeCount - 1;
+  }
+
+  // 平行光强度/颜色（单一写入者，其它地方不要再直接改 light.intensity）
+  private applyLight(): void {
     const light = this.light;
     if (!light) {
       return;
@@ -278,17 +302,6 @@ export class EnvironmentController {
     }
     this.curSeg = PHASES.length - 2;
     this.curK = 0;
-  }
-
-  // 三通道关键帧插值（返回长度 3 的数组：[r, g, b]）
-  private sample(ra: number[], ga: number[], ba: number[]): number[] {
-    const i = this.curSeg;
-    const k = this.curK;
-    return [
-      ra[i] + (ra[i + 1] - ra[i]) * k,
-      ga[i] + (ga[i + 1] - ga[i]) * k,
-      ba[i] + (ba[i + 1] - ba[i]) * k,
-    ];
   }
 
   // 单通道关键帧插值

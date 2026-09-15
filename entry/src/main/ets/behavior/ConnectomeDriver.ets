@@ -43,6 +43,9 @@ export class ConnectomeDrive {
   public totalGroups: number = 61;
   public neurons: number = 139255;
   public edges: number = 2698236;
+
+  // 各功能群的放电率（次/秒），下标即群号；用于大脑状态小窗逐个列出活跃脑区
+  public groupRates: number[] = [];
 }
 
 export class ConnectomeDriver {
@@ -59,6 +62,9 @@ export class ConnectomeDriver {
   private emaStartle = 0;
   private emaSpikes = 0;
   private drive: ConnectomeDrive = new ConnectomeDrive();
+  // 逐群放电累积（每个 tick 累加一次，取用时换算成"次/秒"并清空）
+  private groupAcc: number[] = [];
+  private groupTicks: number = 0;
 
   isRunning(): boolean {
     return this.workerInst !== null;
@@ -70,6 +76,22 @@ export class ConnectomeDriver {
 
   getDrive(): ConnectomeDrive {
     return this.drive;
+  }
+
+  // 取各组放电率（次/秒）并重置累积窗口；窗口内无数据时返回上一次结果。
+  // worker 的 tick 为 10Hz，故实耗秒数 = tick 数 × 0.1。
+  takeGroupRates(): number[] {
+    if (this.groupTicks > 0 && this.groupAcc.length > 0) {
+      const secs = Math.max(0.001, this.groupTicks * 0.1);
+      const out: number[] = [];
+      for (let i = 0; i < this.groupAcc.length; i++) {
+        out.push(this.groupAcc[i] / secs);
+        this.groupAcc[i] = 0;
+      }
+      this.drive.groupRates = out;
+      this.groupTicks = 0;
+    }
+    return this.drive.groupRates;
   }
 
   // 初始化并启动（读取 31MB 连接组，需要数秒）
@@ -237,6 +259,19 @@ export class ConnectomeDriver {
       // 放电率用 EMA 平滑：单 tick 放电数在 0~90 间剧烈波动，直接 ×10 会显示成 0 或几百
       this.emaSpikes += (fired * 10 - this.emaSpikes) * 0.15;
       this.drive.spikesPerSec = this.emaSpikes;
+      // 逐群累积（用于大脑状态小窗的"活跃脑区"明细）
+      if (this.groupAcc.length !== spikes.length) {
+        const acc: number[] = [];
+        for (let i = 0; i < spikes.length; i++) {
+          acc.push(0);
+        }
+        this.groupAcc = acc;
+        this.groupTicks = 0;
+      }
+      for (let i = 0; i < spikes.length; i++) {
+        this.groupAcc[i] += spikes[i];
+      }
+      this.groupTicks++;
     } else if (type === 'stats') {
       this.drive.avgTickMs = msg.avgTickMs as number;
       this.drive.activeGroups = msg.activeGroups as number;

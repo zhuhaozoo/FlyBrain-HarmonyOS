@@ -10,6 +10,7 @@ import { ConnectomeDriver } from '../behavior/ConnectomeDriver';
 import { FlyBrain } from '../behavior/FlyBrain';
 import { flyConfig } from '../behavior/FlyConfig';
 import { FLY_DEATH_NAMES, FLY_STATE_NAMES, FlyState } from '../behavior/FlyTypes';
+import { groupLabel, groupRegion } from '../behavior/NeuronGroups';
 import { EnvironmentController } from '../scene/EnvironmentController';
 import { FlyRenderer } from '../scene/FlyRenderer';
 import { FrogController } from '../scene/FrogController';
@@ -84,6 +85,9 @@ export struct ScenePage {
   @State private crisis: boolean = false;
   @State private deathText: string = '';
   @State private achiText: string = '';
+  // 活跃脑区明细：按放电率排序的功能群名称 + 横条（数据来自 Worker 每 tick 上报的逐群放电）
+  @State private groupSummary: string = '';
+  @State private groupLines: string[] = [];
 
   aboutToAppear(): void {
     try {
@@ -110,6 +114,12 @@ export struct ScenePage {
         this.env.attach(this.sceneMgr.light, this.sceneMgr.camera);
         this.env.setNodes(this.sceneMgr.extraNodes);
         this.frog.setNodes(this.sceneMgr.extraNodes);
+        // 把树上果实的位置（顶层节点，position 即世界坐标）交给行为层：
+        // 果实成熟后自己落到地面，成为果蝇的自主食物来源
+        for (let i = 0; i < this.sceneMgr.fruitNodes.length; i++) {
+          const p = this.sceneMgr.fruitNodes[i].position;
+          this.brain.setFruitPosition(i, p.x, p.z, p.y);
+        }
         this.applyLight(); // 把初始光照档位同步给环境控制器与行为层
         this.sceneOpt = { scene: this.sceneMgr.scene, modelType: ModelType.SURFACE } as SceneOptions;
         this.loadFailed = !this.renderer.isAttached();
@@ -245,6 +255,8 @@ export struct ScenePage {
           this.connTotal = d.totalGroups;
           this.connTickMs = Math.round(d.avgTickMs);
           this.connReady = d.ready;
+          // 活跃脑区明细：取本窗口内各群放电率（读取即重置累积，故只在这里调用一次）
+          this.refreshGroupDetail(this.driver.takeGroupRates());
         }
         this.uiBeat++;
         this.driveText = text;
@@ -268,11 +280,79 @@ export struct ScenePage {
     this.brain.setLightLevel(this.env.isNight() ? 0 : level);
   }
 
+  // M4.2：把「各群放电率」整理成可读明细。
+  // 逐群放电数由 Worker 每 tick 上报，驱动侧累积后换算成"次/秒"再交到这里；
+  // 名称表见 behavior/NeuronGroups.ets（数据源 neuron_meta.json）。
+  private refreshGroupDetail(rates: number[]): void {
+    if (rates.length === 0) {
+      return;
+    }
+    const idx: number[] = [];
+    let maxRate = 0.5;
+    for (let i = 0; i < rates.length; i++) {
+      if (rates[i] > 0.5) {
+        idx.push(i);
+        if (rates[i] > maxRate) {
+          maxRate = rates[i];
+        }
+      }
+    }
+    // 按放电率降序（简单插入排序：最多 63 项，开销可忽略）
+    for (let i = 1; i < idx.length; i++) {
+      const v = idx[i];
+      let j = i - 1;
+      while (j >= 0 && rates[idx[j]] < rates[v]) {
+        idx[j + 1] = idx[j];
+        j--;
+      }
+      idx[j + 1] = v;
+    }
+    // 脑区维度汇总：感觉 / 中央 / 驱动 / 运动 各有多少群在活跃
+    let nSense = 0;
+    let nCentral = 0;
+    let nDrive = 0;
+    let nMotor = 0;
+    for (let i = 0; i < idx.length; i++) {
+      const r = groupRegion(idx[i]);
+      if (r === '感觉') {
+        nSense++;
+      } else if (r === '中央') {
+        nCentral++;
+      } else if (r === '驱动') {
+        nDrive++;
+      } else if (r === '运动') {
+        nMotor++;
+      }
+    }
+    this.groupSummary = `感觉${nSense} 中央${nCentral} 驱动${nDrive} 运动${nMotor}`;
+
+    const top = 8;
+    const lines: string[] = [];
+    const n = Math.min(top, idx.length);
+    for (let i = 0; i < n; i++) {
+      const gid = idx[i];
+      const ratio = rates[gid] / maxRate;
+      const bars = Math.max(1, Math.round(ratio * 6));
+      let bar = '';
+      for (let b = 0; b < bars; b++) {
+        bar += '█';
+      }
+      lines.push(`${groupLabel(gid)} ${bar} ${rates[gid].toFixed(0)}/s`);
+    }
+    if (idx.length > top) {
+      lines.push(`…另有 ${idx.length - top} 个脑区在放电`);
+    }
+    this.groupLines = lines;
+  }
+
   private syncPropNodes(dt: number): void {
     const total = this.brain.getTotalTime();
     const pose = this.brain.getPose();
     const foods = this.brain.getFoods();
-    for (let i = 0; i < this.sceneMgr.foodNodes.length && i < foods.length; i++) {
+    const userCount = this.brain.getUserFoodCount();
+
+    // 用户投喂：弹跳落地
+    for (let i = 0; i < this.sceneMgr.foodNodes.length && i < userCount; i++) {
       const node = this.sceneMgr.foodNodes[i];
       const f = foods[i];
       if (!node) {
@@ -289,6 +369,22 @@ export struct ScenePage {
         (node as Node).position = { x: f.x, y: 0.07 * s + bounce, z: f.z };
       } else {
         (node as Node).visible = false;
+      }
+    }
+
+    // 树上果实：挂果/下落/落地时可见，被吃掉后隐藏直到重新结果
+    for (let i = 0; i < this.sceneMgr.fruitNodes.length; i++) {
+      const node = this.sceneMgr.fruitNodes[i];
+      const f = foods[userCount + i];
+      if (!node || !f) {
+        continue;
+      }
+      const visible = f.respawn <= 0 && (f.active || f.hangY > 0);
+      (node as Node).visible = visible;
+      if (visible) {
+        const s = 1 - 0.7 * f.eaten;
+        (node as Node).scale = { x: s, y: s, z: s };
+        (node as Node).position = { x: f.x, y: f.y, z: f.z };
       }
     }
 
@@ -895,6 +991,19 @@ export struct ScenePage {
           Blank()
           Text(`${this.connActive} / ${this.connTotal}`).fontSize(12).fontColor('#FFE6ECF2')
         }.width('100%')
+        // 逐群明细：直接引用 @State（@Builder 参数是值快照，不能靠传参刷新）
+        if (this.groupSummary !== '') {
+          Text(this.groupSummary).fontSize(10.5).fontColor('#FF8FA3B0').width('100%')
+        }
+        if (this.groupLines.length > 0) {
+          Column({ space: 1 }) {
+            ForEach(this.groupLines, (line: string, i: number) => {
+              Text(line).fontSize(10.5).fontColor('#FFCBD8E2').width('100%').maxLines(1)
+            }, (line: string, i: number) => `g${i}-${line}`)
+          }
+          .width('100%')
+          .margin({ top: 2, bottom: 2 })
+        }
         Row() {
           Text('单步耗时').fontSize(12).fontColor('#FF9FB0BD')
           Blank()
@@ -905,15 +1014,20 @@ export struct ScenePage {
       }
       this.StatRow('脑规模', '13.9万神经元 · 270万突触')
 
+      // 整行可点（onClick 挂在撑满宽度的 Row 上，而不是只挂在文字上 ——
+      // 文字自身的命中区太小、实测注入点击容易打空，见易错总结第 26 条）
       Row() {
+        Blank()
         Text('查看 3D 大脑 →')
           .fontSize(12).fontColor('#FF9AD5CA')
-          .padding({ top: 6, bottom: 6 })
-          .onClick(() => {
-            this.brainPopup = false;
-            this.navStack.pushPathByName('brain', '');
-          })
-      }.width('100%').justifyContent(FlexAlign.End)
+          .padding({ top: 8, bottom: 8, left: 12, right: 4 })
+      }
+      .width('100%')
+      .justifyContent(FlexAlign.End)
+      .onClick(() => {
+        this.brainPopup = false;
+        this.navStack.pushPathByName('brain', '');
+      })
     }
     .width(236)
     .padding(12)

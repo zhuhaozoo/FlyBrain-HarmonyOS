@@ -500,6 +500,24 @@ const materials = [
   { name: 'water_shallow', baseColor: lin4(0x6fa8e0, 0.55), roughness: 0.2, alphaMode: 'BLEND' },
 ];
 
+// 天空穹顶配色（9 段，索引即 sky_i 的编号）。必须与 entry/.../FlyConfig.ets 的 skyPhases 一致：
+// 相位落在 [skyPhases[i], skyPhases[i+1]) 时显示 sky_i。
+const SKY_PHASES = [0, 0.06, 0.12, 0.45, 0.60, 0.66, 0.70, 0.74, 0.90, 1.0];
+const SKY_HEX = [0x8FA6D8, 0x9CB6DC, 0x87CEEB, 0x87CEEB, 0xC9A98F, 0xFF9A5A, 0xA5705E, 0x0B1026, 0x0B1026];
+const MAT_SKY_BASE = materials.length;   // = 30
+for (let i = 0; i < SKY_HEX.length; i++) {
+  const base = srgb2lin(SKY_HEX[i]);
+  materials.push({
+    name: `sky_${i}`,
+    baseColor: base,
+    roughness: 1.0,
+    // 自发光让天空不受平行光强弱影响（夜晚该暗是靠颜色本身变深，而不是被灯照黑）；
+    // 同时保留 baseColor，万一某些引擎弱化 emissive，也还能看出正确颜色。
+    // 系数取 0.85：实测偏低时天空会显得发灰、认不出是蓝天。
+    emissive: [base[0] * 0.85, base[1] * 0.85, base[2] * 0.85],
+  });
+}
+
 // ---------- 组装几何与节点 ----------
 const meshes = [];   // {geometry, material}
 const nodes = [];    // {name, mesh?, children?, translation?, rotation?, scale?}
@@ -620,6 +638,7 @@ const TREE_SPECS = [
   const rng = makeRng(0x7ee501);
 
   let fruitIdx = 0;
+  const fruitPending = [];   // 果实的绝对坐标，稍后作为顶层节点挂上（见下方说明）
   for (let ti = 0; ti < TREE_SPECS.length; ti++) {
     const spec = TREE_SPECS[ti];
     const h = spec.h, lean = spec.lean;
@@ -664,13 +683,18 @@ const TREE_SPECS = [
         rotation: quatY(rng() * Math.PI),
       }));
     }
-    // 果实 ×3 挂在树冠表面（兼作食物彩蛋）
+    // 果实 ×3：**记为顶层节点**（绝对坐标 = 树根 + 树冠偏移 + 冠内偏移）。
+    // 之所以不挂在树冠下：果实成熟后要自己落到地面被果蝇吃掉，
+    // 挂在树冠里会被树的摇摆带着走、也无法脱离树干。
     for (let f = 0; f < 3; f++) {
       const a = rng() * Math.PI * 2;
-      crownChildren.push(addNode({
-        name: `fruit_${fruitIdx}`, mesh: fruitMesh,
-        translation: [0.40 * spec.s * Math.cos(a), (0.24 + 0.40 * rng()) * spec.s, 0.40 * spec.s * Math.sin(a)],
-      }));
+      const fx = 0.40 * spec.s * Math.cos(a);
+      const fy = (0.24 + 0.40 * rng()) * spec.s;
+      const fz = 0.40 * spec.s * Math.sin(a);
+      fruitPending.push({
+        name: `fruit_${fruitIdx}`,
+        pos: [spec.x + lean + fx, h + fy, spec.z + fz],
+      });
       fruitIdx++;
     }
 
@@ -681,6 +705,10 @@ const TREE_SPECS = [
       name: `trunk_${ti}`, mesh: trunkMesh, children: [crown].concat(branchChildren),
     });
     addNode({ name: `tree_${ti}`, translation: [spec.x, 0, spec.z], children: [trunk] }, true);
+  }
+  // 果实作为顶层节点补挂（位置即世界坐标，行为层据此判断"落地点"）
+  for (const fp of fruitPending) {
+    addNode({ name: fp.name, mesh: fruitMesh, translation: fp.pos }, true);
   }
 }
 
@@ -716,6 +744,55 @@ const TREE_SPECS = [
     }));
   }
   addNode({ name: 'stars', children: starChildren }, true);
+}
+
+// ==== 6.5) 天空穹顶 ×9（昼夜用）====
+// 为什么是"多个穹顶 + 切换可见"而不是"一个穹顶 + 运行时改色"：
+// camera.clearColor 在真机上不生效（M0 已知）；而运行时改材质要走 MaterialProperty，
+// 写入口径不确定，写错会直接变成编译错误卡住构建。可见性切换只用 Node.visible —— 最稳，
+// 且同一时刻只有一个穹顶可见，绘制开销可忽略。
+// 半径 35：要大于相机最远距离（22）才能保证相机始终在球内、也不会被剔除。
+const SKY_RADIUS = 35;
+{
+  // 球面，法线朝内（观察者在球内）。
+  // 关键：**两个绕序都输出**。只输出单向时，若引擎对背面剔除的处理与预期不同，
+  // 从球内看就会被整片剔除、直接露出组件底色（实测就是这样：天空一直是灰的）。
+  // 双向输出后无论引擎是否真正支持 doubleSided，球内都必然可见；
+  // 若引擎支持 doubleSided，背向的那一面会被剔除，不会与正面打架。
+  const makeSkyDome = (R, lat = 8, lon = 16) => {
+    const g = new Geometry();
+    const id = [];
+    for (let i = 0; i <= lat; i++) {
+      const theta = i * Math.PI / lat;
+      for (let j = 0; j <= lon; j++) {
+        const phi = j * 2 * Math.PI / lon;
+        const x = Math.sin(theta) * Math.cos(phi);
+        const y = Math.cos(theta);
+        const z = Math.sin(theta) * Math.sin(phi);
+        id.push(g.addVertex(x * R, y * R, z * R, -x, -y, -z));
+      }
+    }
+    for (let i = 0; i < lat; i++) {
+      for (let j = 0; j < lon; j++) {
+        const a = id[i * (lon + 1) + j];
+        const a1 = id[i * (lon + 1) + j + 1];
+        const b = id[(i + 1) * (lon + 1) + j];
+        const b1 = id[(i + 1) * (lon + 1) + j + 1];
+        g.addTri(a, a1, b);
+        g.addTri(b, a1, b1);
+        g.addTri(a, b, a1);
+        g.addTri(b, b1, a1);
+      }
+    }
+    return g;
+  };
+  // 注意：glTF 没有节点级 visible 属性（不在规范里），所以显隐只能由运行时设定。
+  // 场景加载后 SceneManager 会先把 sky_* 全部隐藏，再由 EnvironmentController 每帧
+  // 只打开当前时段对应的那一个。
+  for (let i = 0; i < SKY_HEX.length; i++) {
+    const mesh = addMesh(makeSkyDome(SKY_RADIUS), MAT_SKY_BASE + i);
+    addNode({ name: `sky_${i}`, mesh }, true);
+  }
 }
 
 // ==== 7) 青蛙（含可伸缩舌头） ====
@@ -1159,6 +1236,8 @@ const REQUIRED = [
   'crown_0', 'crown_1', 'crown_2', 'fruit_0', 'fruit_8',
   // 昼夜
   'sun_pivot', 'sun_disc', 'moon_pivot', 'moon_disc', 'stars', 'star_0', 'star_29',
+  // 天空穹顶（按时段切换可见）
+  'sky_0', 'sky_4', 'sky_8',
   // 青蛙（tongue 伸缩、pupil 蓄力前移与眨眼）
   'frog', 'frog_body', 'frog_tongue', 'frog_eye_l', 'frog_eye_r',
   'frog_pupil_l', 'frog_pupil_r',

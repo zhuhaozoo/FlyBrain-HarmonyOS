@@ -12,7 +12,9 @@ export class SceneManager {
   public flyNode: Node | null = null;
   public wingLeft: Node | null = null;
   public wingRight: Node | null = null;
+  public skyNodes: Node[] = [];          // 天空穹顶（按时段切换可见）
   public foodNodes: Node[] = [];
+  public fruitNodes: Node[] = [];        // 树上果实（M4.2：可落地食用）
   public spotNode: Node | null = null;
   // M4：按名字缓存的场景节点（一次性 DFS 查找，避免每帧查找）
   public extraNodes: Map<string, Node> = new Map<string, Node>();
@@ -77,6 +79,14 @@ export class SceneManager {
           this.foodNodes.push(fn);
         }
       }
+      // 树上果实：9 颗，位置即世界坐标（生成脚本把它们放在树冠处）
+      this.fruitNodes = [];
+      for (let i = 0; i < 9; i++) {
+        const fn = this.findByName(root, `fruit_${i}`);
+        if (fn) {
+          this.fruitNodes.push(fn);
+        }
+      }
       this.spotNode = this.findByName(root, 'lightspot');
       if (this.spotNode) {
         (this.spotNode as Node).visible = false;
@@ -128,6 +138,24 @@ export class SceneManager {
         }
       }
     }
+    // 天空穹顶：glTF 没有节点级 visible，加载后先全部隐藏，
+    // 再由 EnvironmentController 每帧只打开当前时段对应的那一个
+    this.skyNodes = [];
+    for (let i = 0; i < this.cfgSkyDomeCount(); i++) {
+      const key = `sky_${i}`;
+      const node = this.findByName(root, key);
+      if (node) {
+        node.visible = false;
+        this.skyNodes.push(node);
+        this.extraNodes.set(key, node);
+      }
+    }
+    console.info(`[FlyBrain] sky domes registered: ${this.skyNodes.length}/${this.cfgSkyDomeCount()}`);
+  }
+
+  // 天空穹顶数量（与生成脚本 SKY_HEX 长度一致，这里避免引用 FlyConfig 造成耦合）
+  private cfgSkyDomeCount(): number {
+    return 9;
   }
 
   // 取 M4 节点（未注册/不存在返回 null）
