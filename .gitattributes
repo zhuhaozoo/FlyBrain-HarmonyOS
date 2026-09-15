@@ -1,6 +1,10 @@
 # 统一换行符处理，并显式标记二进制资源，避免 Git 误做文本转换
 * text=auto
 
+# 签名配置不入库：提交时由 clean filter 自动剥离 signingConfigs
+# （本地文件不受影响，构建照常可用；安装见 tools/setup-local-git.mjs）
+build-profile.json5 filter=strip-signing
+
 *.png binary
 *.jpg binary
 *.jpeg binary

@@ -1,10 +1,9 @@
 {
   "app": {
-    // 签名配置（signingConfigs）刻意不纳入公开仓库：其中包含本机绝对路径与签名口令。
-    // 首次构建前请在 DevEco Studio 中生成自己的签名：
-    //   File → Project Structure → Signing Configs → 勾选 "Automatically generate signature"
-    //   （需登录华为开发者账号），IDE 会自动在下方补回 signingConfigs 与 products 的 signingConfig 字段。
-    // 详见 README.md「构建与运行」。
+    // 签名配置（signingConfigs）不入库：由各开发者在本机 DevEco Studio 中生成，
+    // 避免把本机绝对路径与签名口令提交到公开仓库。
+    // 首次构建：File → Project Structure → Signing Configs → 勾选 "Automatically generate signature"，
+    // IDE 会把 signingConfigs 写回本文件（写回的内容不会进入版本库，见 README「签名配置为什么不入库」）。
     "products": [
       {
         "name": "default",
