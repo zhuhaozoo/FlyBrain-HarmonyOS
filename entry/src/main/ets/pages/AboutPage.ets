@@ -28,16 +28,23 @@ export struct AboutPage {
     Text(t).fontSize(13).fontColor($r('app.color.fy_text_tertiary')).width('100%').margin({ top: 16, bottom: 4 })
   }
 
-  // 开源地址卡片：整卡可点，URL 单独一行可长按复制
+  // 开源地址卡片：URL 行可点（用系统浏览器打开），长按可复制
   @Builder
   RepoCard() {
     Column() {
       Text('本项目已完整开源（MIT License），欢迎 Star、提 Issue 与 PR。')
         .fontSize(14).fontColor($r('app.color.fy_text_primary')).lineHeight(22).width('100%')
+      // 点击直接挂在 URL 文字上：整卡 onClick 在 Scroll 内的命中不稳定，文字本身更可靠
       Text(REPO_URL)
         .fontSize(14).fontColor($r('app.color.fy_accent')).lineHeight(22).width('100%')
         .margin({ top: 8 })
         .copyOption(CopyOptions.LocalDevice)
+        .onClick(() => {
+          this.openRepo();
+        })
+      Text('点击用系统浏览器打开 · 长按可复制')
+        .fontSize(11).fontColor($r('app.color.fy_text_tertiary')).width('100%')
+        .margin({ top: 6 })
     }
     .width('100%')
     .alignItems(HorizontalAlign.Start)

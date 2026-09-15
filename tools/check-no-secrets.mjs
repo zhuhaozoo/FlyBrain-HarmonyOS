@@ -17,7 +17,7 @@ const RULES = [
     why: '私钥文件内容' },
   { id: 'ohos-config-path', re: /\.ohos[\\/]config[\\/]/i,
     why: 'HarmonyOS 本机证书目录下的实际路径' },
-  { id: 'windows-user-path', re: /[A-Za-z]:\\+Users\\+[^\\\s"']+/i,
+  { id: 'windows-user-path', re: /[A-Za-z]:\\+Users\\+[^\\\s"'<]+/i,
     why: '本机 Windows 用户目录绝对路径（含用户名）' },
   { id: 'lan-ip', re: /\b(192\.168\.\d{1,3}\.\d{1,3}|10\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/,
     why: '局域网 IP（无线调试等本机网络信息）' },
@@ -31,12 +31,41 @@ const SELF = ['tools/check-no-secrets.mjs', 'tools/setup-local-git.mjs'];
 // 误报豁免：在行尾加 privacy-check:allow 即跳过该行（例如文档里举例说明规则本身时）
 const ALLOW = /privacy-check:allow/;
 
+// 定位 git：新装的 Git 可能还没进入当前终端的 PATH，这里逐个候选路径兜底
+// （由 Git 触发的 pre-commit 钩子里 PATH 已由 Git 注入，这个兜底主要给手动运行用）
+function resolveGit() {
+  const candidates = [
+    process.env.GIT,
+    'git',
+    'C:/Program Files/Git/cmd/git.exe',
+    'C:/Program Files (x86)/Git/cmd/git.exe',
+    'C:/Program Files/Git/bin/git.exe',
+  ].filter(Boolean);
+
+  for (const c of candidates) {
+    try {
+      execFileSync(c, ['--version'], { stdio: 'ignore' });
+      return c;
+    } catch {
+      // 试下一个
+    }
+  }
+  console.error('✗ 找不到 git 可执行文件。请安装 Git for Windows，或用 GIT 环境变量指定路径。');
+  process.exit(1);
+}
+
+const GIT = resolveGit();
+
 function listFiles() {
+  // 用 -z：路径以 NUL 分隔且不做转义，避免中文文件名被 Git 加上引号与八进制转义
   const args = scanAll
-    ? ['ls-files']
-    : ['diff', '--cached', '--name-only', '--diff-filter=ACM'];
-  return execFileSync('git', args, { encoding: 'utf8' })
-    .split('\n')
+    ? ['ls-files', '-z']
+    : ['diff', '--cached', '--name-only', '-z', '--diff-filter=ACM'];
+  return execFileSync(GIT, args, {
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })
+    .split('\u0000')
     .map((s) => s.trim())
     .filter(Boolean);
 }
@@ -45,7 +74,11 @@ function stagedContent(path) {
   // 取「暂存区里的版本」，而不是工作区版本 —— 这才是真正会被提交的内容
   const args = scanAll ? ['show', `HEAD:${path}`] : ['show', `:${path}`];
   try {
-    return execFileSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    return execFileSync(GIT, args, {
+      encoding: 'utf8',
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'], // 默认会把 git 的 stderr 直接继承到终端，这里收起来
+    });
   } catch {
     return null;
   }

@@ -263,6 +263,41 @@ if (!this.isWide && y > this.areaH - panelH - this.bottomAvoid) { return; }  // 
 
 ---
 
+### 26. 父容器的 `onClick` 会被已可点击的子节点吃掉 ⭐
+
+**现象**：关于页「开源地址」卡片把 `onClick` 挂在 `@Builder` 返回的 `Column`（整卡可点）
+上，真机点击**完全无响应** —— 连`onClick` 回调里的 `console.error/warn` 都没有输出，
+hilog 里查不到任何痕迹（说明回调根本没被调用）。
+
+**原因**：卡片内的 URL 用了 `.copyOption(CopyOptions.LocalDevice)`（长按复制），
+`uitest dumpLayout` 显示该 `Text` 自身就是 `clickable:true / longClickable:true` ——
+它已经是一个**消费点击手势的节点**。触摸落在它上面时被它自己消费，
+不再冒泡给父 `Column` 的 `onClick`。外层又包在 `Scroll` 里，命中链路更不确定。
+
+> 判据：**凡是给子元素加过 `copyOption` / 自身可点击属性（`Text`+`copyOption`、
+> `Image`+`onClick`、`Button` 等），父容器的 `onClick` 就不可靠了。**
+
+**正确写法**：把 `onClick` 直接挂在**真正要点的那个可见元素**上（本例是 URL 的 `Text`），
+需要「整卡可点」时，在每个子节点上都挂同一个处理函数，或给容器配 `hitTestBehavior`：
+
+```ts
+@Builder
+RepoCard() {
+  Column() {
+    Text('说明文字…').width('100%')
+    Text(REPO_URL)
+      .copyOption(CopyOptions.LocalDevice)   // 长按复制
+      .onClick(() => { this.openRepo(); })   // ✅ 点击挂在文字本身上
+  }
+  .onClick(() => { this.openRepo(); })        // 容器上也挂，双保险
+}
+```
+
+**验证方式**：hilog 里能看到目标能力被拉起
+（本例 `A00000/com.huawei.hmos.browser`），而不是只靠"界面没变化"倒推。
+
+---
+
 ## 三、官方 HDS 组件（UIDesignKit）坑
 
 ### 14. `HdsNavDestination` 必须配套 `HdsNavigation` 使用 ⭐
