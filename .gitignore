@@ -27,3 +27,11 @@ build-logs/
 # 解压后的 .csv 与 connectome.bin 可由 .gz 重新生成（见 README「数据管线」）
 /tools/data/*.csv
 /tools/data/*.bin
+
+# ===== 以下是本机自用文件，不纳入公开仓库 =====
+# AI 协作规则（本机开发流程约定）
+/AGENTS.md
+# 签名不入库的防护脚本（clean filter + 提交前隐私扫描）
+/tools/strip-signing.mjs
+/tools/check-no-secrets.mjs
+/tools/setup-local-git.mjs

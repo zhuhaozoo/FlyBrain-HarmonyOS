@@ -10,6 +10,9 @@ const REPO_URL: string = 'https://github.com/zhuhaozoo/FlyBrain-HarmonyOS';
 @Component
 export struct AboutPage {
   @StorageProp('fy_top_avoid') topAvoid: number = 40;
+  // M4：由场景页写入的「这只果蝇的一生」统计
+  @StorageProp('fy_deaths') deaths: number = 0;
+  @StorageProp('fy_last_death') lastDeath: string = '';
 
   private openRepo(): void {
     try {
@@ -56,6 +59,20 @@ export struct AboutPage {
     })
   }
 
+  // 这只果蝇的一生：必须在本 @Builder 内直接引用 @StorageProp，
+  // 不能靠参数传值（@Builder 参数是值快照，见易错总结第 8 条）
+  @Builder
+  LifeCard() {
+    Text(this.deaths <= 0
+      ? '这只果蝇目前安然无恙 —— 还没死过。'
+      : `累计死亡 ${this.deaths} 次 · 最后一次：${this.lastDeath}`)
+      .fontSize(14).fontColor($r('app.color.fy_text_primary')).lineHeight(22)
+      .width('100%')
+      .padding(12)
+      .borderRadius(12)
+      .backgroundColor($r('app.color.fy_card_bg'))
+  }
+
   @Builder
   Card(content: string) {
     Text(content)
@@ -89,6 +106,9 @@ export struct AboutPage {
           this.Card('Dorkenwald, S., Matsliah, A., Sterling, A.R. et al. ' +
             'Neuronal wiring diagram of an adult brain. Nature 634, 124–138 (2024).\n' +
             '数据来自 FlyWire 联盟（flywire.ai / codex.flywire.ai）公开数据集（FAFB v783）。')
+
+          this.SectionTitle('这只果蝇的一生')
+          this.LifeCard()
 
           this.SectionTitle('开源致谢')
           this.Card('· flybrain（snedea/flybrain，MIT License）——行为与仿真设计参考蓝本，' +

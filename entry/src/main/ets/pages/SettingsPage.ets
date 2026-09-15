@@ -1,4 +1,4 @@
-// 设置页：查看行为参数默认值 + 调节全局速度倍率（本地持久化）。
+// 设置页：查看行为参数默认值 + 调节全局速度倍率 + M4 生态开关（本地持久化）。
 // 标题栏使用系统材质沉浸光感（HdsNavDestination + hdsMaterial.IMMERSIVE）。
 import { preferences } from '@kit.ArkData';
 import { common } from '@kit.AbilityKit';
@@ -8,6 +8,8 @@ import { FlyConfig, flyConfig } from '../behavior/FlyConfig';
 @Component
 export struct SettingsPage {
   @State private speed: number = flyConfig.speedScale;
+  @State private dayNight: boolean = flyConfig.dayNightEnabled;
+  @State private frogOn: boolean = flyConfig.frogEnabled;
   private store: preferences.Preferences | null = null;
 
   aboutToAppear(): void {
@@ -20,6 +22,10 @@ export struct SettingsPage {
         this.speed = saved;
         flyConfig.speedScale = saved;
       }
+      this.dayNight = store.getSync('dayNight', flyConfig.dayNightEnabled) as boolean;
+      this.frogOn = store.getSync('frogEnabled', flyConfig.frogEnabled) as boolean;
+      flyConfig.dayNightEnabled = this.dayNight;
+      flyConfig.frogEnabled = this.frogOn;
     } catch (err) {
       console.warn(`[FlyBrain] load prefs failed: ${JSON.stringify(err)}`);
     }
@@ -27,12 +33,20 @@ export struct SettingsPage {
 
   private persistSpeed(v: number): void {
     flyConfig.speedScale = v;
+    this.persist('speedScale', v);
+  }
+
+  private persistBool(key: string, v: boolean): void {
+    this.persist(key, v);
+  }
+
+  private persist(key: string, v: number | boolean): void {
     const store = this.store;
     if (store === null) {
       return;
     }
     try {
-      store.putSync('speedScale', v);
+      store.putSync(key, v);
       store.flush();
     } catch (err) {
       console.warn(`[FlyBrain] save prefs failed: ${JSON.stringify(err)}`);
@@ -74,6 +88,59 @@ export struct SettingsPage {
                 this.persistSpeed(value);
               }
             })
+
+          Text('生态')
+            .fontSize(13).fontColor($r('app.color.fy_text_tertiary')).width('100%')
+            .margin({ top: 16, bottom: 4 })
+
+          Column({ space: 0 }) {
+            // 开关直接内联在 build 里读取 @State（@Builder 参数是值快照，会读到旧值 —— 见易错总结第 8 条）
+            Row() {
+              Column({ space: 2 }) {
+                Text('昼夜循环').fontSize(15).fontColor($r('app.color.fy_text_primary'))
+                Text('一轮 4 分钟：日月升落、天色与光照同步变化')
+                  .fontSize(11).fontColor($r('app.color.fy_text_tertiary'))
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+
+              Toggle({ type: ToggleType.Switch, isOn: this.dayNight })
+                .selectedColor($r('app.color.fy_accent'))
+                .onChange((v: boolean) => {
+                  this.dayNight = v;
+                  flyConfig.dayNightEnabled = v;
+                  this.persistBool('dayNight', v);
+                })
+            }
+            .width('100%')
+            .padding({ top: 10, bottom: 10 })
+
+            Divider().color($r('app.color.fy_divider'))
+
+            Row() {
+              Column({ space: 2 }) {
+                Text('捕食者青蛙').fontSize(15).fontColor($r('app.color.fy_text_primary'))
+                Text('关闭后青蛙不再索敌（低端机可关以提性能）')
+                  .fontSize(11).fontColor($r('app.color.fy_text_tertiary'))
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+
+              Toggle({ type: ToggleType.Switch, isOn: this.frogOn })
+                .selectedColor($r('app.color.fy_accent'))
+                .onChange((v: boolean) => {
+                  this.frogOn = v;
+                  flyConfig.frogEnabled = v;
+                  this.persistBool('frogEnabled', v);
+                })
+            }
+            .width('100%')
+            .padding({ top: 10, bottom: 10 })
+          }
+          .width('100%')
+          .padding(12)
+          .borderRadius(12)
+          .backgroundColor($r('app.color.fy_card_bg'))
 
           Text('行为参数（默认值，取自 flybrain 项目语义）')
             .fontSize(13).fontColor($r('app.color.fy_text_tertiary')).width('100%')

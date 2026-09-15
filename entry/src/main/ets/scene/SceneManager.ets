@@ -14,6 +14,8 @@ export class SceneManager {
   public wingRight: Node | null = null;
   public foodNodes: Node[] = [];
   public spotNode: Node | null = null;
+  // M4：按名字缓存的场景节点（一次性 DFS 查找，避免每帧查找）
+  public extraNodes: Map<string, Node> = new Map<string, Node>();
 
   // 轨道相机参数（球坐标）
   private yaw: number = Math.PI * 0.85;
@@ -25,7 +27,7 @@ export class SceneManager {
   private readonly maxRadius: number = 22.0;    // 可拉远看全景（原 11.0 不够）
   private target: Vec3 = { x: 0, y: 0.30, z: 0 }; // 注视点略高于地面
   private lastEye: Vec3 = { x: 0, y: 3, z: 5 };   // applyCamera 后的相机位置
-  private baseIntensity: number = -1;             // 平行光默认强度（首次读取）
+  private userLightFactor: number = 1.0;          // 用户手动光照倍率（明亮 1.0 / 昏暗 0.35 / 黑暗 0.05）
   // 视角追踪：锁定果蝇。person=0 第一人称（贴头部朝前）/ person=1 第三人称（后上方跟随）
   private followMode: boolean = false;
   private followPerson: number = 0;
@@ -79,17 +81,59 @@ export class SceneManager {
       if (this.spotNode) {
         (this.spotNode as Node).visible = false;
       }
+      this.registerExtra(root);
       if (!this.flyNode) {
         this.dumpTree(root, 40);
       }
       console.info(`[FlyBrain] nodes found: fly=${this.flyNode !== null}, ` +
         `wingL=${this.wingLeft !== null}, wingR=${this.wingRight !== null}, ` +
-        `food=${this.foodNodes.length}, spot=${this.spotNode !== null}`);
+        `food=${this.foodNodes.length}, spot=${this.spotNode !== null}, ` +
+        `extra=${this.extraNodes.size}`);
       return this.flyNode !== null && this.flyNode !== undefined;
     } catch (err) {
       console.error(`[FlyBrain] Scene init failed: ${JSON.stringify(err)}`);
       return false;
     }
+  }
+
+  // M4：一次性注册需要按名字访问的节点，并隐藏所有特效节点（事件期间才显示）
+  private registerExtra(root: Node): void {
+    const names: string[] = [
+      // 环境
+      'sun_pivot', 'sun', 'moon_pivot', 'moon', 'stars', 'river',
+      // 树木（一级/二级摇摆驱动点）
+      'trunk_0', 'trunk_1', 'trunk_2', 'crown_0', 'crown_1', 'crown_2',
+      // 果蝇头部轴心（进食低头）
+      'head_pivot',
+      // 青蛙
+      'frog', 'frog_body', 'frog_tongue', 'frog_eye_l', 'frog_eye_r',
+      'frog_pupil_l', 'frog_pupil_r',
+    ];
+    for (const n of names) {
+      const node = this.findByName(root, n);
+      if (node) {
+        this.extraNodes.set(n, node);
+      }
+    }
+    // 特效节点：plus_fx / wind_line / ripple / path_dot
+    const fxGroups: string[] = ['plus_fx', 'wind_line', 'ripple', 'path_dot'];
+    const fxCounts: number[] = [3, 6, 3, 6];
+    for (let g = 0; g < fxGroups.length; g++) {
+      for (let i = 0; i < fxCounts[g]; i++) {
+        const key = `${fxGroups[g]}_${i}`;
+        const node = this.findByName(root, key);
+        if (node) {
+          node.visible = false; // 常态隐藏，事件期间由控制器打开
+          this.extraNodes.set(key, node);
+        }
+      }
+    }
+  }
+
+  // 取 M4 节点（未注册/不存在返回 null）
+  getNode(name: string): Node | null {
+    const n = this.extraNodes.get(name);
+    return n === undefined ? null : n;
   }
 
   // 单指拖拽 → 环绕视角（dx/dy 为像素增量）
@@ -127,24 +171,12 @@ export class SceneManager {
     return this.followPerson;
   }
 
-  // 注视点平滑跟随果蝇（钳制在场地内，避免相机跑到场景外）
+  // 记录果蝇当前位置（追踪模式与交互定位使用）。
+  // 注意：这里**不再**把相机注视点逐帧拉向果蝇 —— 那样会让用户在拖拽转视角后
+  // 视角被自动"吸"回果蝇身上，无法自由观察场景。注视点只由用户操作（拖拽/缩放/追踪开关）改变。
   followFly(x: number, z: number): void {
     this.flyX = x;
     this.flyZ = z;
-    if (this.followMode) {
-      return; // 追踪模式由 setFlyPose 每帧直接驱动
-    }
-    const k = 0.12;
-    // 钳制到场地半径内：近景时果蝇必须始终在画面中，远景时可略有滞后
-    const lim = this.cfgArenaRadius();
-    const tx = clamp(x, -lim, lim);
-    const tz = clamp(z, -lim, lim);
-    this.target.x += (tx - this.target.x) * k;
-    this.target.z += (tz - this.target.z) * k;
-  }
-
-  private cfgArenaRadius(): number {
-    return 4.0; // 与 FlyConfig.arenaRadius(4.6) 同量级，保证果蝇始终在视野内
   }
 
   // 追踪模式下每帧写入果蝇完整位姿（位置 + 高度 + 朝向）
@@ -158,17 +190,15 @@ export class SceneManager {
     }
   }
 
-  // 光照档位（0 黑暗 / 0.5 昏暗 / 1 明亮）：按首帧读取的默认强度等比缩放
+  // 用户手动光照档位（0 黑暗 / 0.5 昏暗 / 1 明亮）→ 倍率。
+  // 注意：平行光的 intensity 自 M4 起由 EnvironmentController 统一写入（它要叠加昼夜曲线），
+  // 这里只换算倍率，不再直接改 intensity —— 避免出现两个写入者互相覆盖。
   setLightLevel(level: number): void {
-    if (!this.light) {
-      return;
-    }
-    if (this.baseIntensity < 0) {
-      this.baseIntensity = this.light.intensity;
-      console.info(`[FlyBrain] light base intensity=${this.baseIntensity}`);
-    }
-    const factor = level === 0 ? 0.05 : (level === 0.5 ? 0.35 : 1.0);
-    this.light.intensity = this.baseIntensity * factor;
+    this.userLightFactor = level === 0 ? 0.05 : (level === 0.5 ? 0.35 : 1.0);
+  }
+
+  getUserLightFactor(): number {
+    return this.userLightFactor;
   }
 
   // 屏幕归一化坐标 (u,v)（组件内左上角为原点）反投影到地面 y≈0 平面

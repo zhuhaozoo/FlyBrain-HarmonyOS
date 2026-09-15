@@ -9,8 +9,10 @@ import { Node } from '@kit.ArkGraphics3D';
 import { ConnectomeDriver } from '../behavior/ConnectomeDriver';
 import { FlyBrain } from '../behavior/FlyBrain';
 import { flyConfig } from '../behavior/FlyConfig';
-import { FLY_STATE_NAMES, FlyState } from '../behavior/FlyTypes';
+import { FLY_DEATH_NAMES, FLY_STATE_NAMES, FlyState } from '../behavior/FlyTypes';
+import { EnvironmentController } from '../scene/EnvironmentController';
 import { FlyRenderer } from '../scene/FlyRenderer';
+import { FrogController } from '../scene/FrogController';
 import { SceneManager } from '../scene/SceneManager';
 
 const TOOL_TOUCH = 0;
@@ -35,6 +37,8 @@ export struct ScenePage {
   private renderer: FlyRenderer = new FlyRenderer(flyConfig);
   private brain: FlyBrain = new FlyBrain(flyConfig);
   private driver: ConnectomeDriver = new ConnectomeDriver();
+  private env: EnvironmentController = new EnvironmentController(flyConfig);
+  private frog: FrogController = new FrogController(flyConfig);
   private sceneOpt: SceneOptions | null = null;
   private animator: AnimatorResult | null = null;
   private lastFrameMs: number = 0;
@@ -46,6 +50,11 @@ export struct ScenePage {
   private areaH: number = 0;
   private pinchFingers: boolean = false;  // 捏合手势进行中（避免滑杆与手势互相打架）
   private lightNames: string[] = ['亮', '暗', '黑'];
+  // M4：特效计时（秒）
+  private plusFxT: number = -1;           // "+"进食特效
+  private lastCycles: number = 0;         // 已完成的昼夜轮数（成就判定）
+  private deathsAtCycleStart: number = 0;
+  private achiTimer: number = 0;          // 成就文案显示倒计时
 
   @State private loading: boolean = true;
   @State private loadFailed: boolean = false;
@@ -70,6 +79,11 @@ export struct ScenePage {
   @State private connTickMs: number = 0;
   @State private connReady: boolean = false;
   @State private uiBeat: number = 0;  // 心跳自增，保证每轮统计都会触发一次重建
+  // M4：生命值 / 天敌预警 / 死亡文案
+  @State private hpValue: number = 100;
+  @State private crisis: boolean = false;
+  @State private deathText: string = '';
+  @State private achiText: string = '';
 
   aboutToAppear(): void {
     try {
@@ -80,6 +94,9 @@ export struct ScenePage {
         flyConfig.speedScale = saved;
         this.speedValue = saved;
       }
+      // M4 功能开关（设置页可调，默认开）
+      flyConfig.dayNightEnabled = store.getSync('dayNight', flyConfig.dayNightEnabled) as boolean;
+      flyConfig.frogEnabled = store.getSync('frogEnabled', flyConfig.frogEnabled) as boolean;
     } catch (err) {
       console.warn(`[FlyBrain] load speed prefs failed: ${JSON.stringify(err)}`);
     }
@@ -87,7 +104,13 @@ export struct ScenePage {
     this.sceneMgr.init().then((ok: boolean) => {
       this.loading = false;
       if (ok && this.sceneMgr.scene !== null) {
-        this.renderer.attach(this.sceneMgr.flyNode, this.sceneMgr.wingLeft, this.sceneMgr.wingRight);
+        this.renderer.attach(this.sceneMgr.flyNode, this.sceneMgr.wingLeft, this.sceneMgr.wingRight,
+          this.sceneMgr.getNode('head_pivot'));
+        // M4：环境控制器（昼夜/树摆/风线/涟漪）与青蛙控制器接管各自的节点
+        this.env.attach(this.sceneMgr.light, this.sceneMgr.camera);
+        this.env.setNodes(this.sceneMgr.extraNodes);
+        this.frog.setNodes(this.sceneMgr.extraNodes);
+        this.applyLight(); // 把初始光照档位同步给环境控制器与行为层
         this.sceneOpt = { scene: this.sceneMgr.scene, modelType: ModelType.SURFACE } as SceneOptions;
         this.loadFailed = !this.renderer.isAttached();
         this.startLoop();
@@ -128,10 +151,26 @@ export struct ScenePage {
       const now = Date.now();
       const dt = Math.min((now - this.lastFrameMs) / 1000, 0.05);
       this.lastFrameMs = now;
+
+      // M4：先把天敌状态喂给行为层（蓄力提示 + 命中伤害），再推进行为，保证同帧生效。
+      // 蓄力窗口只有 0.8s，这里按"变化才写 @State"刷新预警，避免每帧重建又多给即时反馈。
+      const charging = this.frog.isCharging();
+      this.brain.setFrogThreat(charging);
+      if (charging !== this.crisis) {
+        this.crisis = charging;
+      }
+      this.frog.update(dt, this.brain.getPose().x, this.brain.getPose().z, !this.brain.isDead());
+      if (this.frog.consumeHit()) {
+        this.brain.hitByFrog();
+      }
+
       this.brain.update(dt);
-      this.renderer.apply(this.brain.getPose(), this.brain.getState(), this.brain.getTotalTime());
-      this.syncPropNodes();
       const pose = this.brain.getPose();
+      const st = this.brain.getState();
+      // 环境（昼夜/树摆/风线/涟漪）每帧驱动；风力来自行为层
+      this.env.update(dt, this.brain.getWindStrength());
+      this.renderer.apply(pose, st, this.brain.getTotalTime(), this.isExcited(st));
+      this.syncPropNodes(dt);
       this.sceneMgr.setFlyPose(pose.x, pose.y, pose.z, pose.yaw);
       this.sceneMgr.followFly(pose.x, pose.z);
       // 缩放滑杆跟随手势变化（追踪模式下同步）
@@ -141,13 +180,45 @@ export struct ScenePage {
           this.zoomRadius = r;
         }
       }
-      const st = this.brain.getState();
       if (st !== this.lastState) {
         this.lastState = st;
         this.stateLabel = FLY_STATE_NAMES[st];
       }
       if (now - this.lastDriveTextMs > 300) {
         this.lastDriveTextMs = now;
+        // M4：生命值 / 死亡倒计时同步到 @State（crisis 已在帧循环里即时更新）
+        this.hpValue = Math.round(this.brain.getHp());
+        if (st === FlyState.Dead) {
+          const cause = FLY_DEATH_NAMES[this.brain.getLastDeathCause()];
+          this.deathText = `💀 ${cause} · ${this.brain.getRespawnCountdown().toFixed(1)}s 后重生`;
+          // 写入 AppStorage，供「关于」页展示"这只果蝇的一生"
+          AppStorage.setOrCreate('fy_deaths', this.brain.getDeathCount());
+          AppStorage.setOrCreate('fy_last_death', cause);
+        } else {
+          this.deathText = '';
+        }
+        // 死亡期间整体压暗 10%
+        this.env.setDeathDim(st === FlyState.Dead);
+        // 轻量成就：连续喂养 3 次 / 完整一轮昼夜零死亡
+        if (this.brain.consumeTrustUp()) {
+          this.achiText = '🤝 信任+1';
+          this.achiTimer = 3;
+        }
+        const cy = this.env.getCycles();
+        if (cy !== this.lastCycles) {
+          if (this.brain.getDeathCount() === this.deathsAtCycleStart) {
+            this.achiText = '🌙 平安一夜';
+            this.achiTimer = 4;
+          }
+          this.lastCycles = cy;
+          this.deathsAtCycleStart = this.brain.getDeathCount();
+        }
+        if (this.achiTimer > 0) {
+          this.achiTimer -= 0.3;
+          if (this.achiTimer <= 0) {
+            this.achiText = '';
+          }
+        }
         let text = `饿${Math.round(this.brain.getHunger() * 100)}% ` +
           `怕${Math.round(this.brain.getFear() * 100)}% ` +
           `累${Math.round(this.brain.getFatigue() * 100)}%`;
@@ -180,7 +251,24 @@ export struct ScenePage {
     (this.animator as AnimatorResult).play();
   }
 
-  private syncPropNodes(): void {
+  // M4：趋光兴奋态（Wander + 光斑生效 + 够亮）
+  private isExcited(st: FlyState): boolean {
+    return st === FlyState.Wander && this.brain.isSpotActive() &&
+      this.brain.getLightLevel() > flyConfig.phototaxisLight;
+  }
+
+  // 光照档位：用户倍率交给渲染层，行为层用的 lightLevel 在夜间被压到 0
+  // （夜晚 = 休息阈值 0.4、无趋光；用户开聚光仍可让果蝇晒太阳回血）
+  private applyLight(): void {
+    const level = this.lightIdx === 0 ? 1 : (this.lightIdx === 1 ? 0.5 : 0);
+    this.sceneMgr.setLightLevel(level);
+    this.env.setUserLightFactor(this.sceneMgr.getUserLightFactor());
+    this.brain.setLightLevel(this.env.isNight() ? 0 : level);
+  }
+
+  private syncPropNodes(dt: number): void {
+    const total = this.brain.getTotalTime();
+    const pose = this.brain.getPose();
     const foods = this.brain.getFoods();
     for (let i = 0; i < this.sceneMgr.foodNodes.length && i < foods.length; i++) {
       const node = this.sceneMgr.foodNodes[i];
@@ -189,22 +277,120 @@ export struct ScenePage {
         continue;
       }
       if (f.active) {
+        // 投喂落地弹跳：0.4s 内从 +0.6 高度落两次
+        f.dropT = Math.min(1, f.dropT + dt / 0.4);
+        const e = f.dropT;
+        const bounce = 0.6 * (1 - e) * (0.5 + 0.5 * Math.cos(e * Math.PI * 4));
         (node as Node).visible = true;
         const s = 1 - 0.7 * f.eaten;
         (node as Node).scale = { x: s, y: s, z: s };
-        (node as Node).position = { x: f.x, y: 0.07 * s, z: f.z };
+        (node as Node).position = { x: f.x, y: 0.07 * s + bounce, z: f.z };
       } else {
         (node as Node).visible = false;
       }
     }
+
+    // 光斑：呼吸缩放 0.94~1.06（0.8Hz）
     const spot = this.sceneMgr.spotNode;
     if (spot) {
       if (this.brain.isSpotActive()) {
+        const breathe = 1.0 + 0.06 * Math.sin(total * 0.8 * Math.PI * 2);
         (spot as Node).visible = true;
         (spot as Node).position = { x: this.brain.getSpotX(), y: 0.02, z: this.brain.getSpotZ() };
+        (spot as Node).scale = { x: breathe, y: 1, z: breathe };
       } else {
         (spot as Node).visible = false;
       }
+    }
+
+    // 觅食虚线路径：Seek 时在果蝇与食物之间铺 6 个流动的路径点
+    this.syncPathDots(total, pose.x, pose.z);
+
+    // 进食完成「＋」特效
+    this.syncPlusFx(dt, pose.x, pose.z);
+  }
+
+  private syncPathDots(total: number, flyX: number, flyZ: number): void {
+    const show = this.brain.getState() === FlyState.Seek;
+    if (!show) {
+      for (let i = 0; i < 6; i++) {
+        const n = this.sceneMgr.getNode(`path_dot_${i}`);
+        if (n) {
+          n.visible = false;
+        }
+      }
+      return;
+    }
+    // 最近的食物作为路径终点
+    const foods = this.brain.getFoods();
+    let tx = 0;
+    let tz = 0;
+    let best = 1e9;
+    for (let i = 0; i < foods.length; i++) {
+      const f = foods[i];
+      if (!f.active) {
+        continue;
+      }
+      const d = Math.hypot(f.x - flyX, f.z - flyZ);
+      if (d < best) {
+        best = d;
+        tx = f.x;
+        tz = f.z;
+      }
+    }
+    if (best > 1e8) {
+      return;
+    }
+    for (let i = 0; i < 6; i++) {
+      const n = this.sceneMgr.getNode(`path_dot_${i}`);
+      if (!n) {
+        continue;
+      }
+      const t = (i + 1) / 7;
+      n.position = {
+        x: flyX + (tx - flyX) * t,
+        y: 0.02 + 0.01 * Math.sin(total * 4 + i),
+        z: flyZ + (tz - flyZ) * t,
+      };
+      // 依次明灭，形成"朝食物流动"的指示
+      const phase = (total * 1.6 - i * 0.18) % 1.0;
+      n.visible = phase < 0.6;
+    }
+  }
+
+  private syncPlusFx(dt: number, flyX: number, flyZ: number): void {
+    if (this.brain.consumeFeedDone()) {
+      this.plusFxT = 0;
+    }
+    if (this.plusFxT < 0) {
+      return;
+    }
+    this.plusFxT += dt;
+    const p = this.plusFxT / 0.8;
+    if (p >= 1) {
+      for (let i = 0; i < 3; i++) {
+        const n = this.sceneMgr.getNode(`plus_fx_${i}`);
+        if (n) {
+          n.visible = false;
+        }
+      }
+      this.plusFxT = -1;
+      return;
+    }
+    for (let i = 0; i < 3; i++) {
+      const n = this.sceneMgr.getNode(`plus_fx_${i}`);
+      if (!n) {
+        continue;
+      }
+      const ang = i * 2.094; // 三个方向散开
+      n.visible = true;
+      n.position = {
+        x: flyX + 0.18 * Math.cos(ang),
+        y: 0.10 + 0.55 * p + i * 0.05,
+        z: flyZ + 0.18 * Math.sin(ang),
+      };
+      const s = 1.0 - 0.45 * p;
+      n.scale = { x: s, y: s, z: s };
     }
   }
 
@@ -233,8 +419,7 @@ export struct ScenePage {
       this.brain.setLightSpot(p.x, p.z, true);
       if (this.lightIdx !== 0) {
         this.lightIdx = 0;
-        this.brain.setLightLevel(1);
-        this.sceneMgr.setLightLevel(1);
+        this.applyLight();
       }
     } else {
       const hit = this.brain.touch(p.x, p.z);
@@ -246,12 +431,10 @@ export struct ScenePage {
 
   private cycleLight(): void {
     this.lightIdx = (this.lightIdx + 1) % 3;
-    const level = this.lightIdx === 0 ? 1 : (this.lightIdx === 1 ? 0.5 : 0);
-    this.brain.setLightLevel(level);
-    this.sceneMgr.setLightLevel(level);
-    if (level < 1) {
+    if (this.lightIdx !== 0) {
       this.brain.setLightSpot(0, 0, false);
     }
+    this.applyLight();
   }
 
   private async toggleConnectome(): Promise<void> {
@@ -298,16 +481,21 @@ export struct ScenePage {
       .onClick(onTap)
   }
 
-  // 状态行：行为 + 内驱力 + 放电率
+  // 状态行：行为 + 内驱力 + 放电率 + 生命值（M4）。
+  // 青蛙蓄力时整行转为红色警示，给出 0.8s 的救援反应窗口。
   @Builder
   StatusLine() {
     Row({ space: 8 }) {
-      Text(`${this.stateLabel} · ${this.driveText}`)
+      Text(this.crisis ? `⚠ 天敌！${this.stateLabel}` : `${this.stateLabel} · ${this.driveText}`)
         .fontSize(12)
-        .fontColor('#FF9AD5CA')
+        .fontColor(this.crisis ? '#FFFF7A7A' : '#FF9AD5CA')
         .fontWeight(FontWeight.Medium)
         .maxLines(1)
         .layoutWeight(1)
+      Text(`❤${this.hpValue}`)
+        .fontSize(12)
+        .fontColor(this.hpValue <= 30 ? '#FFFF6B6B' : '#FFDDE4EA')
+        .fontWeight(FontWeight.Medium)
       Button(this.paused ? '继续' : '暂停')
         .fontSize(12).height(28).backgroundColor(CHIP_BG)
         .onClick(() => {
@@ -318,7 +506,7 @@ export struct ScenePage {
     .width('100%')
     .padding({ left: 12, right: 10, top: 6, bottom: 6 })
     .borderRadius(14)
-    .backgroundColor(GLASS_BG)
+    .backgroundColor(this.crisis ? '#66A03030' : GLASS_BG)
     .border(GLASS_BORDER)
   }
 
@@ -788,6 +976,39 @@ export struct ScenePage {
           .justifyContent(FlexAlign.Center)
           .width('100%')
           .height('100%')
+      }
+
+      // ==== 层2：死亡提示（M4）====
+      if (this.deathText !== '') {
+        Column({ space: 10 }) {
+          Text('💀').fontSize(42)
+          Text(this.deathText)
+            .fontSize(14).fontColor('#FFFFD9D9')
+            .textAlign(TextAlign.Center)
+        }
+        .justifyContent(FlexAlign.Center)
+        .alignItems(HorizontalAlign.Center)
+        .width('100%')
+        .height('100%')
+        .hitTestBehavior(HitTestMode.Transparent)
+      }
+
+      // ==== 层2.5：轻量成就提示（M4）====
+      if (this.achiText !== '') {
+        Column() {
+          Text(this.achiText)
+            .fontSize(13).fontColor('#FFFFF0C0')
+            .padding({ left: 14, right: 14, top: 6, bottom: 6 })
+            .borderRadius(14)
+            .backgroundColor(GLASS_BG)
+            .border(GLASS_BORDER)
+        }
+        .width('100%')
+        .height('100%')
+        .padding({ top: this.topAvoid + 64 })
+        .alignItems(HorizontalAlign.Center)
+        .justifyContent(FlexAlign.Start)
+        .hitTestBehavior(HitTestMode.Transparent)
       }
 
       // ==== 层3：顶部栏（标题 + 大脑徽章 + 设置/关于）+ 大脑状态小窗 ====

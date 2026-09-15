@@ -298,6 +298,34 @@ RepoCard() {
 
 ---
 
+### 27. 节点 `scale` 会传递给子节点，别用缩放代替建模高度 ⭐
+
+**现象**：给树做的「一级摇摆」完全不生效 —— 树干绕根部摆动了，但树冠纹丝不动；
+如果把树冠改成树干的子节点，树冠的位置又飞到天上去了。
+
+**原因**：两件事叠加。
+1. 一级摇摆要求**树冠挂在树干下**（树干转，树冠跟着转），做成兄弟节点则树干转不动树冠；
+2. 但节点 `scale` 是**沿层级向下传递**的。原先树干写成 `scale: [s, h, s]`（用缩放代替真实高度），
+   树冠一旦成为其子节点，`translation: [0, h, 0]` 会被再乘一次 `h`，位置严重错位。
+
+**正确写法**：把高度**烘焙进网格**，节点不再靠缩放表达尺寸，子节点位移就是真实米数：
+
+```js
+// tools/gen_world_glb.mjs
+const trunkMesh = addMesh(makeCylinderUp(0.055, 0.095, spec.h, 12), MAT_TRUNK); // 高度烘焙
+const crown = addNode({ name: `crown_${ti}`, translation: [0, spec.h, 0], children: [...] });
+const trunk = addNode({ name: `trunk_${ti}`, mesh: trunkMesh, children: [crown] }); // 不再带 scale
+```
+
+**判据**：只要某个节点既要用 `rotation` 当"摆动轴心"、下面又挂了子节点，
+就**不要**给它加 `scale` —— 否则子节点会被一起缩放，位置全错。
+
+> 附带教训：写生成脚本自查规则时要克制。我一开始加了「有 children 就不许有 mesh」的断言，
+> 结果把树上合法的 `trunk（有网格）+ crown（有子节点）` 判成了错误 ——
+> **glTF 允许一个节点同时带 mesh 与 children**，断言要针对真正的错误（如节点重名）而不是想当然的洁癖。
+
+---
+
 ## 三、官方 HDS 组件（UIDesignKit）坑
 
 ### 14. `HdsNavDestination` 必须配套 `HdsNavigation` 使用 ⭐

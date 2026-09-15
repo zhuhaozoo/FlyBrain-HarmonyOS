@@ -75,6 +75,57 @@ export class FlyConfig {
   public connStartleG: number = 6;        // 机械感受群放电→惊吓
   public connFeedG: number = 3;           // 舐吸运动群放电→觅食意图
   public connGroomG: number = 5;          // 头/腹运动群放电→理毛
+
+  // ---- M4：生命系统（HP）----
+  public hpMax: number = 100;
+  public hpStart: number = 100;
+  public hpRespawn: number = 60;          // 重生后的 HP
+  public hpStarveDrain: number = 2;       // 饥饿满值时每秒扣血
+  public hpWaterDrain: number = 30;       // 落水每秒扣血
+  public hpEatGain: number = 18;          // 吃完一份食物回血
+  public hpDrinkGain: number = 5;         // 饮水回血
+  public hpSpotGain: number = 1;          // 在光斑内晒太阳每秒回血
+  public deathDuration: number = 5;       // 死亡到重生的秒数
+  public feedLowHunger: number = 0.9;     // 饥饿超过此值才开始扣血（留一点缓冲）
+
+  // ---- M4：场地几何（与 tools/gen_world_glb.mjs 的河流参数保持一致）----
+  public flyArenaRadius: number = 7.2;    // 飞行可达半径（> 河流外沿 6.6，实现"飞行可过河"）
+  public riverA0: number = 0.349;         // 河流弧起始角（弧度，atan2(z,x) 度量；20°）
+  public riverA1: number = 1.885;         // 河流弧结束角（108°）
+  public riverInner: number = 4.9;        // 河流内半径
+  public riverOuter: number = 6.6;        // 河流外半径
+  public waterNearBand: number = 0.5;     // 距水域多近算"临水"
+  public drinkWait: number = 2;           // 临水驻留多久触发饮水
+  public drinkDuration: number = 3;       // 饮水动作时长
+
+  // ---- M4：昼夜循环（渲染层 EnvironmentController 使用）----
+  public dayCycleSeconds: number = 240;   // 一轮昼夜时长
+  public dayNightRatio: number = 0.50;    // 白天占比
+  public duskRatio: number = 0.12;        // 黄昏
+  public nightRatio: number = 0.26;       // 夜晚
+  // 黎明 = 1 - 其余三者
+  public skyDay: string = '#87CEEB';
+  public skyDusk: string = '#FF9A5A';
+  public skyNight: string = '#0B1026';
+  public skyDawn: string = '#8FA6D8';
+  public sunOrbitRadius: number = 9;
+
+  // ---- M4：青蛙 ----
+  public frogGuardRadius: number = 2.2;   // 警戒圈半径
+  public frogChargeTime: number = 0.8;    // 蓄力（预警）时长 → 用户救援窗口
+  public frogAttackTime: number = 0.18;   // 舌头弹出时长
+  public frogHitRadius: number = 0.35;    // 命中判定半径
+  public frogHitDamage: number = 50;      // 命中扣血
+  public frogCooldown: number = 40;       // 进食一次后的冷却（避免劝退）
+  public frogMissCooldown: number = 8;    // 未命中后的冷却
+  public frogPuffMin: number = 6;         // 鼓腮间隔（随机区间）
+  public frogPuffMax: number = 10;
+  public frogX: number = 4.55 * Math.cos(1.117);  // 与生成脚本一致（r=4.55, θ=64°）
+  public frogZ: number = 4.55 * Math.sin(1.117);
+
+  // ---- M4：功能开关（设置页可调，持久化）----
+  public dayNightEnabled: boolean = true;
+  public frogEnabled: boolean = true;
 }
 
 // 全局单例：行为层与 UI 共享同一份配置

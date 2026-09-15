@@ -98,45 +98,7 @@
 4. 点击 `Apply / OK` —— IDE 会把 `signingConfigs` 以及 `products[].signingConfig`
    写回 `build-profile.json5`。
 
-签名写回后**不会被提交进仓库**，机制见下一节。
-
-### 1.1 签名配置为什么不入库
-
-HarmonyOS 的签名配置只能放在工程级 `build-profile.json5` 里（没有独立的本地签名文件，
-官方排错指引 `00304035` 的做法也是「清空该字段后重新签名」），而这个文件本身要进版本库。
-为了既让本地构建可用、又不把本机路径与签名口令推到公开仓库，本仓库用了一个 Git **clean filter**。
-
-拉取仓库后**执行一次**即可：
-
-```bash
-node tools/setup-local-git.mjs
-```
-
-它做两件事（配置只写在本仓库 `.git/` 下，不进版本库，也不影响其它工程）：
-
-| 机制 | 作用 |
-|---|---|
-| clean filter `strip-signing` | 提交时自动从 `build-profile.json5` 剔除 `signingConfigs` 与 `products[].signingConfig`，**工作区文件保持原样**，本地构建照常可用。并标记为 `required`，过滤失败时提交直接报错，不会退化成「原样提交」 |
-| `pre-commit` 钩子 | 兜底扫描暂存区，命中签名凭据或本机隐私信息（Windows 用户目录绝对路径、HarmonyOS 证书目录下的实际路径、局域网 IP 等）就拦下提交 |
-
-所以**不需要在每次提交前手动删签名配置** —— DevEco 反复写回签名信息也不会污染仓库。
-
-提交前想确认这次确实没带上签名，可以看暂存区的版本：
-
-```bash
-git add -A
-git diff --cached -- build-profile.json5     # 看不到 signingConfigs 即正常
-```
-
-也可单独跑一次全库扫描：
-
-```bash
-node tools/check-no-secrets.mjs --all
-```
-
-> `setup-local-git.mjs` 必须在本机跑一次：Git 出于安全考虑不允许把 filter 与钩子的定义随仓库分发，
-> 所以这两项只能在本地安装。刚 `clone` 下来还没跑过的仓库是「没有防护」的，请先执行它再开始改代码。
-
+签名配置属于本机信息（含本机绝对路径与签名口令），**请勿提交到版本库**。
 
 ### 2. 构建
 
@@ -236,7 +198,6 @@ gunzip -k tools/data/coordinates.csv.gz tools/data/classification.csv.gz
 | [`docs/果蝇大脑App开发文档.md`](docs/果蝇大脑App开发文档.md) | 主文档：背景、方案选型、架构分层、M0~M3 实施记录 |
 | [`docs/ArkTS-ArkUI易错总结.md`](docs/ArkTS-ArkUI易错总结.md) | **强烈推荐阅读**：25 条实战踩坑（编译错误 / 运行时行为 / HDS 组件 / 3D 渲染），每条含「现象 → 原因 → 正确写法」 |
 | [`docs/场景与玩法设计-M4.md`](docs/场景与玩法设计-M4.md) | M4 场景与玩法设计 |
-| [`AGENTS.md`](AGENTS.md) | AI 编码助手协作规则（编码前置要求、构建约定） |
 
 ---
 

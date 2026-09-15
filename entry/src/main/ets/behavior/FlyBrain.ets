@@ -3,7 +3,7 @@
 //   startle > fly > feed > groom > brace > rest > phototaxis > seek > wander > idle
 // 本类为纯逻辑，不依赖任何 3D/渲染 API，可独立单测。
 import { FlyConfig } from './FlyConfig';
-import { FoodItem, FlyPose, FlyState } from './FlyTypes';
+import { FlyDeathCause, FoodItem, FlyPose, FlyState } from './FlyTypes';
 import { clamp, normalizeAngle } from '../common/Math3D';
 
 const TWO_PI = Math.PI * 2;
@@ -46,8 +46,21 @@ export class FlyBrain {
   private connGroom: number = 0;
   private connStartle: number = 0;
 
+  // ---- M4：生命值 / 饮水 / 死亡 / 青蛙 ----
+  private hp: number = 100;
+  private deathCount: number = 0;
+  private lastDeathCause: FlyDeathCause = FlyDeathCause.None;
+  private nearWaterTimer: number = 0;
+  private drinkGainApplied: boolean = false;
+  private feedDoneFlag: boolean = false;       // 刚吃完一份（供页面触发 "+" 特效）
+  private frogThreat: boolean = false;         // 青蛙蓄力中（危机提醒）
+  private forceTakeoff: boolean = false;       // 被青蛙击中后挣脱起飞
+  private feedStreak: number = 0;              // 连续进食次数（轻量成就）
+  private trustFlag: boolean = false;          // 连续进食 3 次 → "信任+1"
+
   constructor(cfg: FlyConfig) {
     this.cfg = cfg;
+    this.hp = cfg.hpStart;
     this.pose.yaw = Math.random() * TWO_PI;
     this.turnTimer = 0.5;
     for (let i = 0; i < cfg.maxFoods; i++) {
@@ -65,7 +78,15 @@ export class FlyBrain {
     }
     this.total += dt;
     this.stateTimer += dt;
+    // 死亡期间冻结内驱力与状态机，只跑重生倒计时
+    if (this.state === FlyState.Dead) {
+      this.updateDead();
+      return;
+    }
     this.updateDrives(dt);
+    if (this.state === FlyState.Dead) {
+      return; // updateDrives 里可能因伤害致死
+    }
     switch (this.state) {
       case FlyState.Wander:
         this.updateWander(dt);
@@ -96,6 +117,9 @@ export class FlyBrain {
         break;
       case FlyState.Seek:
         this.updateSeek(dt);
+        break;
+      case FlyState.Drinking:
+        this.updateDrinking(dt);
         break;
       case FlyState.Idle:
         if (this.stateTimer >= this.phaseDuration) {
@@ -149,8 +173,116 @@ export class FlyBrain {
     return this.lightLevel;
   }
 
+  // 当前风力强度 0~1（阵风期间 >0；渲染层据此驱动树木摇摆与风线）
+  getWindStrength(): number {
+    return this.windTimer > 0 ? this.windStrength : 0;
+  }
+
   isSpotActive(): boolean {
     return this.spotActive;
+  }
+
+  // ---------- M4：生命值 / 死亡 ----------
+  getHp(): number {
+    return this.hp;
+  }
+
+  getHpRatio(): number {
+    return clamp(this.hp / this.cfg.hpMax, 0, 1);
+  }
+
+  isDead(): boolean {
+    return this.state === FlyState.Dead;
+  }
+
+  getDeathCount(): number {
+    return this.deathCount;
+  }
+
+  getLastDeathCause(): FlyDeathCause {
+    return this.lastDeathCause;
+  }
+
+  // 死亡到重生的剩余秒数（UI 文案用）
+  getRespawnCountdown(): number {
+    if (this.state !== FlyState.Dead) {
+      return 0;
+    }
+    return Math.max(0, this.cfg.deathDuration - this.stateTimer);
+  }
+
+  // 吃完一份食物的瞬时事件（页面据此触发 "+" 特效），读取即清除
+  consumeFeedDone(): boolean {
+    const v = this.feedDoneFlag;
+    this.feedDoneFlag = false;
+    return v;
+  }
+
+  // 连续进食 3 次（轻量成就「信任+1」），读取即清除
+  consumeTrustUp(): boolean {
+    const v = this.trustFlag;
+    this.trustFlag = false;
+    return v;
+  }
+
+  // ---------- M4：青蛙事件接口（由页面/青蛙控制器驱动，行为层只做逻辑响应） ----------
+  // 蓄力预警：供状态行显示「⚠ 天敌！」并提供救援窗口
+  setFrogThreat(on: boolean): void {
+    this.frogThreat = on;
+  }
+
+  isFrogThreat(): boolean {
+    return this.frogThreat;
+  }
+
+  // 被舌头命中：重伤 + 挣脱后起飞逃离
+  hitByFrog(): void {
+    if (this.state === FlyState.Dead) {
+      return;
+    }
+    this.frogThreat = false;
+    this.damage(this.cfg.frogHitDamage, FlyDeathCause.Frog);
+    if (this.state === FlyState.Dead) {
+      return;
+    }
+    this.stimulusX = this.pose.x;
+    this.stimulusZ = this.pose.z;
+    this.forceTakeoff = true;
+    this.enterStartle();
+  }
+
+  // ---------- M4：河域判定（纯几何，供行为层与渲染层共用） ----------
+  // (x,z) 是否落在河流弧带内
+  isInWater(x: number, z: number): boolean {
+    const r = Math.hypot(x, z);
+    if (r < this.cfg.riverInner || r > this.cfg.riverOuter) {
+      return false;
+    }
+    return this.angleInRiver(Math.atan2(z, x), 0);
+  }
+
+  // 是否临水（含岸边缓冲带，用于饮水彩蛋）
+  isNearWater(): boolean {
+    const x = this.pose.x;
+    const z = this.pose.z;
+    const r = Math.hypot(x, z);
+    const band = this.cfg.waterNearBand;
+    if (r < this.cfg.riverInner - band || r > this.cfg.riverOuter + band) {
+      return false;
+    }
+    const pad = band / Math.max(0.6, r); // 角度余量随半径收窄
+    return this.angleInRiver(Math.atan2(z, x), pad);
+  }
+
+  private angleInRiver(a: number, pad: number): boolean {
+    let ang = a;
+    while (ang < 0) {
+      ang += TWO_PI;
+    }
+    while (ang >= TWO_PI) {
+      ang -= TWO_PI;
+    }
+    return ang >= this.cfg.riverA0 - pad && ang <= this.cfg.riverA1 + pad;
   }
 
   // 连接组涌现模式开关与放电输入
@@ -194,6 +326,7 @@ export class FlyBrain {
     slot.z = z * k;
     slot.eaten = 0;
     slot.active = true;
+    slot.dropT = 0;   // 触发"弹跳落地"（渲染层按 dropT 计算高度）
   }
 
   // 光照档位：0 黑暗 / 0.5 昏暗 / 1 明亮
@@ -280,6 +413,50 @@ export class FlyBrain {
     this.curiosity = clamp(this.curiosity + (Math.random() - 0.5) * 0.12 * dt, 0, 1);
     if (this.windTimer > 0) {
       this.windTimer -= dt;
+    }
+    this.updateHp(dt);
+    this.updateWaterProximity(dt);
+  }
+
+  // 生命值：饥饿耗尽持续掉血、落水重伤、光斑内晒太阳回血
+  private updateHp(dt: number): void {
+    if (this.hunger >= this.cfg.feedLowHunger) {
+      // 从"有缓冲的阈值"到全饥饿线性升到满额，避免一刀切
+      const t = (this.hunger - this.cfg.feedLowHunger) /
+        Math.max(1e-6, 1 - this.cfg.feedLowHunger);
+      this.damage(this.cfg.hpStarveDrain * t * dt, FlyDeathCause.Hunger);
+      if (this.state === FlyState.Dead) {
+        return;
+      }
+    }
+    if (this.isInWater(this.pose.x, this.pose.z)) {
+      this.damage(this.cfg.hpWaterDrain * dt, FlyDeathCause.Water);
+      if (this.state === FlyState.Dead) {
+        return;
+      }
+    }
+    if (this.spotActive && this.lightLevel > 0) {
+      const d = Math.hypot(this.pose.x - this.spotX, this.pose.z - this.spotZ);
+      if (d <= 0.5) {
+        this.heal(this.cfg.hpSpotGain * dt);
+      }
+    }
+  }
+
+  // 临水驻留计时 → 触发饮水彩蛋
+  private updateWaterProximity(dt: number): void {
+    if (this.isGrounded() && this.state !== FlyState.Drinking &&
+      this.state !== FlyState.Startle) {
+      if (this.isNearWater()) {
+        this.nearWaterTimer += dt;
+        if (this.nearWaterTimer >= this.cfg.drinkWait) {
+          this.nearWaterTimer = 0;
+          this.drinkGainApplied = false;
+          this.enterState(FlyState.Drinking, this.cfg.drinkDuration);
+        }
+      } else {
+        this.nearWaterTimer = 0;
+      }
     }
   }
 
@@ -433,11 +610,18 @@ export class FlyBrain {
     this.pose.y = this.cfg.walkBobAmp * Math.abs(Math.sin(this.total * this.cfg.walkBobHz * 2));
     this.advance(dt, this.cfg.fleeSpeed * this.cfg.speedScale);
     if (this.stateTimer >= this.cfg.startleFreeze + this.cfg.startleFlee) {
-      this.enterWander();
+      if (this.forceTakeoff) {
+        // 被青蛙击中后挣脱起飞
+        this.forceTakeoff = false;
+        this.fear = clamp(this.fear + 0.3, 0, 1);
+        this.enterState(FlyState.Takeoff, this.cfg.takeoffDuration);
+      } else {
+        this.enterWander();
+      }
     }
   }
 
-  // 进食：停在食物上吃，食物逐渐消失
+  // 进食：停在食物上吃，食物逐渐消失；吃完一份回血并置完成标记
   private updateFeed(dt: number): void {
     if (this.checkUrgent()) {
       return;
@@ -453,10 +637,46 @@ export class FlyBrain {
     this.hunger = clamp(this.hunger - 0.12 * dt, 0, 1);
     this.fatigue = clamp(this.fatigue - 0.005 * dt, 0, 1);
     if (food.eaten >= 1) {
+      // active=false 后 nearestFood 不再返回它，因此这里的回血与特效标记只会触发一次
       food.active = false;
+      this.heal(this.cfg.hpEatGain);
+      this.feedDoneFlag = true;
+      // 轻量成就：连续吃完 3 份 → 「信任+1」
+      this.feedStreak++;
+      if (this.feedStreak >= 3) {
+        this.feedStreak = 0;
+        this.trustFlag = true;
+      }
     }
     if (food.eaten >= 1 || this.hunger <= this.cfg.hungerStop) {
       this.enterWander();
+    }
+  }
+
+  // 饮水彩蛋：河岸边低头 3 秒，中途离开或受惊则中断
+  private updateDrinking(dt: number): void {
+    if (this.checkUrgent()) {
+      return;
+    }
+    this.pose.y = 0;
+    if (!this.isNearWater()) {
+      this.enterWander();
+      return;
+    }
+    if (!this.drinkGainApplied && this.stateTimer >= this.cfg.drinkDuration * 0.6) {
+      this.drinkGainApplied = true;
+      this.heal(this.cfg.hpDrinkGain);
+    }
+    if (this.stateTimer >= this.cfg.drinkDuration) {
+      this.enterWander();
+    }
+  }
+
+  // 死亡：翻面躺地，倒计时结束后原点重生
+  private updateDead(): void {
+    this.pose.y = 0;
+    if (this.stateTimer >= this.cfg.deathDuration) {
+      this.respawn();
     }
   }
 
@@ -516,6 +736,60 @@ export class FlyBrain {
     this.phaseDuration = duration;
   }
 
+  // ---------- M4：伤害 / 治疗 / 死亡 / 重生 ----------
+  private damage(amount: number, cause: FlyDeathCause): void {
+    if (this.state === FlyState.Dead) {
+      return;
+    }
+    this.hp = clamp(this.hp - amount, 0, this.cfg.hpMax);
+    if (this.hp <= 0) {
+      this.die(cause);
+    }
+  }
+
+  private heal(amount: number): void {
+    if (this.state === FlyState.Dead) {
+      return;
+    }
+    this.hp = clamp(this.hp + amount, 0, this.cfg.hpMax);
+  }
+
+  private die(cause: FlyDeathCause): void {
+    if (this.state === FlyState.Dead) {
+      return;
+    }
+    this.deathCount++;
+    this.lastDeathCause = cause;
+    this.frogThreat = false;
+    this.forceTakeoff = false;
+    this.nearWaterTimer = 0;
+    this.enterState(FlyState.Dead, this.cfg.deathDuration);
+    this.pose.y = 0;
+  }
+
+  // 原点重生：HP 与全部内驱力重置（场上食物保留，不清除用户的投喂）
+  private respawn(): void {
+    this.pose.x = 0;
+    this.pose.z = 0;
+    this.pose.y = 0;
+    this.pose.yaw = Math.random() * TWO_PI;
+    this.hp = this.cfg.hpRespawn;
+    this.hunger = 0.55;
+    this.fear = 0;
+    this.fatigue = 0;
+    this.curiosity = 0.5;
+    this.windTimer = 0;
+    this.windStrength = 0;
+    this.nearWaterTimer = 0;
+    this.frogThreat = false;
+    this.forceTakeoff = false;
+    this.feedStreak = 0;
+    this.turn = 0;
+    this.turnTimer = 0.3;
+    this.groomTimer = 8;
+    this.enterWander();
+  }
+
   private isAirborne(): boolean {
     return this.state === FlyState.Fly || this.state === FlyState.Takeoff;
   }
@@ -553,17 +827,34 @@ export class FlyBrain {
     this.pose.z += Math.cos(this.pose.yaw) * speed * dt;
   }
 
-  // 超出活动半径时平滑转向圆心
+  // 边界处理：河域斥力 + 软化回转 + 绝对边界
+  // 步行软边界为 arenaRadius（4.6），飞行可放到 flyArenaRadius（7.2，越过河流外沿 6.6），
+  // 绝对边界统一为 flyArenaRadius —— 硬钳制只在越过绝对边界时触发，
+  // 避免"从河对岸降落时被瞬移拉回"的突兀表现（此时靠软回转把果蝇走回来）。
   private applyBoundary(): void {
+    // 1) 河域斥力：在地面且高度很低时把果蝇挡在水外（飞行 y≈1.15 可掠过水面）
+    const rWater = Math.hypot(this.pose.x, this.pose.z);
+    if (this.isGrounded() && this.pose.y < 0.3 && rWater > 1e-4 &&
+      this.isInWater(this.pose.x, this.pose.z)) {
+      const k = (this.cfg.riverInner - 0.05) / rWater;
+      this.pose.x *= k;
+      this.pose.z *= k;
+      const away = Math.atan2(-this.pose.x, -this.pose.z);
+      const d = normalizeAngle(away - this.pose.yaw);
+      this.pose.yaw = normalizeAngle(this.pose.yaw + clamp(d, -0.25, 0.25));
+    }
+
+    // 2) 软化回转 + 绝对边界
     const r = Math.hypot(this.pose.x, this.pose.z);
-    const limit = this.cfg.arenaRadius - 0.4;
-    if (r > limit && r > 1e-4) {
+    const softLimit = this.isAirborne() ? this.cfg.flyArenaRadius : this.cfg.arenaRadius;
+    const hardLimit = this.cfg.flyArenaRadius;
+    if (r > softLimit && r > 1e-4) {
       const toCenter = Math.atan2(-this.pose.x, -this.pose.z);
       const diff = normalizeAngle(toCenter - this.pose.yaw);
       const maxTurn = this.cfg.turnRate * 2.2 * 0.016; // 逐帧小步转向
       this.pose.yaw = normalizeAngle(this.pose.yaw + clamp(diff, -maxTurn, maxTurn));
-      if (r > this.cfg.arenaRadius) {
-        const k = this.cfg.arenaRadius / r;
+      if (r > hardLimit) {
+        const k = hardLimit / r;
         this.pose.x *= k;
         this.pose.z *= k;
       }
