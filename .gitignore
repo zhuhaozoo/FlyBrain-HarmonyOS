@@ -1,0 +1,29 @@
+/node_modules
+/oh_modules
+/local.properties
+/.idea
+**/build
+/.hvigor
+.cxx
+/.clangd
+/.clang-format
+/.clang-tidy
+**/.test
+/.appanalyzer
+
+# 构建产物 / 日志
+*.hap
+*.hsp
+build-logs/
+
+# 签名相关：绝不入库（含本机绝对路径与口令）
+*.p12
+*.cer
+*.p7b
+*.keystore
+*.jks
+
+# tools/data 下的中间产物：只保留 .gz 压缩源文件，
+# 解压后的 .csv 与 connectome.bin 可由 .gz 重新生成（见 README「数据管线」）
+/tools/data/*.csv
+/tools/data/*.bin

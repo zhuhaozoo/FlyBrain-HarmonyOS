@@ -1,0 +1,14 @@
+# 统一换行符处理，并显式标记二进制资源，避免 Git 误做文本转换
+* text=auto
+
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.glb binary
+*.gltf binary
+*.bin binary
+*.gz binary
+*.hap binary
+*.p12 binary
+*.cer binary
+*.p7b binary
