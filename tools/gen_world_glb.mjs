@@ -54,6 +54,8 @@ function quatBetween(from, to) {
   return { x: c[0], y: c[1], z: c[2], w: 1 + d };
 }
 function quatY(angle) { return quatFromAxisAngle(0, 1, 0, angle); }
+function quatX(angle) { return quatFromAxisAngle(1, 0, 0, angle); }
+function quatZ(angle) { return quatFromAxisAngle(0, 0, 1, angle); }
 function srgb2lin(hex) {
   const r = ((hex >> 16) & 255) / 255, g = ((hex >> 8) & 255) / 255, b = (hex & 255) / 255;
   const f = (c) => (c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4));
@@ -118,6 +120,207 @@ function makeEllipsoid(a, b, c, cx, cy, cz, lat = 14, lon = 20) {
     g.normals[ix] = nRaw[0] / nl; g.normals[ix + 1] = nRaw[1] / nl; g.normals[ix + 2] = nRaw[2] / nl;
   }
   return g;
+}
+
+// ---------- v3 建模原语（用于提升模型精细度） ----------
+
+// 剖面插值：pts 为 [[z, r], ...] 控制点，按 t 递增；用 smoothstep 段内插值避免折角。
+// 返回函数 t → [r, z]
+function makeProfile(pts) {
+  return (t) => {
+    const n = pts.length - 1;
+    const x = Math.min(0.999999, Math.max(0, t)) * n;
+    const i = Math.floor(x);
+    const f = x - i;
+    const s = f * f * (3 - 2 * f);
+    return [
+      pts[i][1] + (pts[i + 1][1] - pts[i][1]) * s,
+      pts[i][0] + (pts[i + 1][0] - pts[i][0]) * s,
+    ];
+  };
+}
+
+// 旋转体（轴为 +Z）：profile(t) → [r, z]，t 从 0（前端）到 1（后端）。
+// 法线由剖面切线推出：n2D = normalize(dr, -dz)，再绕 Z 旋成 3D。
+function makeRevolutionZ(profile, seg = 24, lat = 20) {
+  const g = new Geometry();
+  const eps = 1e-3;
+  const rings = [];
+  for (let i = 0; i <= lat; i++) {
+    const t = i / lat;
+    const p = profile(t);
+    // 端点半径允许收敛到 0（与 makeSphere 的极点同一做法）：整圈顶点重合，
+    // 连接面退化为零面积三角形，表面仍是闭合的，不会露出内壁
+    const r = Math.max(0, p[0]);
+    const z = p[1];
+    const pA = profile(Math.max(0, t - eps));
+    const pB = profile(Math.min(1, t + eps));
+    const dr = pB[0] - pA[0];
+    const dz = pB[1] - pA[1];
+    const nl = Math.hypot(dr, dz) || 1;
+    const nr = dr / nl;
+    const nz = -dz / nl;
+    const ring = [];
+    for (let j = 0; j <= seg; j++) {
+      const phi = j * 2 * Math.PI / seg;
+      const c = Math.cos(phi), s = Math.sin(phi);
+      ring.push(g.addVertex(r * c, r * s, z, nr * c, nr * s, nz));
+    }
+    rings.push(ring);
+  }
+  for (let i = 0; i < lat; i++) {
+    for (let j = 0; j < seg; j++) {
+      const a = rings[i][j], b = rings[i][j + 1];
+      const c = rings[i + 1][j], d = rings[i + 1][j + 1];
+      g.addTri(a, c, d);
+      g.addTri(a, d, b);
+    }
+  }
+  return g;
+}
+
+// 扫掠管：沿折线 path 生成带半径变化的管（腿/树枝/触角/舌头共用）
+function makeTube(path, radii, seg = 10, capStart = true, capEnd = true) {
+  const g = new Geometry();
+  const n = path.length;
+  const dirs = [];
+  for (let i = 0; i < n; i++) {
+    const a = path[Math.max(0, i - 1)];
+    const b = path[Math.min(n - 1, i + 1)];
+    const d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    const L = Math.hypot(...d) || 1;
+    dirs.push([d[0] / L, d[1] / L, d[2] / L]);
+  }
+  const rings = [];
+  for (let i = 0; i < n; i++) {
+    const d = dirs[i];
+    const up = Math.abs(d[1]) > 0.9 ? [0, 0, 1] : [0, 1, 0];
+    const u = norm3(cross3(up, d));
+    const v = norm3(cross3(d, u));
+    const r = radii[i];
+    const ring = [];
+    for (let j = 0; j <= seg; j++) {
+      const phi = j * 2 * Math.PI / seg;
+      const c = Math.cos(phi), s = Math.sin(phi);
+      const nx = u[0] * c + v[0] * s, ny = u[1] * c + v[1] * s, nz = u[2] * c + v[2] * s;
+      ring.push(g.addVertex(
+        path[i][0] + nx * r, path[i][1] + ny * r, path[i][2] + nz * r, nx, ny, nz));
+    }
+    rings.push(ring);
+  }
+  for (let i = 0; i < n - 1; i++) {
+    for (let j = 0; j < seg; j++) {
+      const a = rings[i][j], b = rings[i][j + 1];
+      const c = rings[i + 1][j], d = rings[i + 1][j + 1];
+      g.addTri(a, d, c);
+      g.addTri(a, b, d);
+    }
+  }
+  if (capStart) {
+    const c0 = g.addVertex(path[0][0], path[0][1], path[0][2], -dirs[0][0], -dirs[0][1], -dirs[0][2]);
+    for (let j = 0; j < seg; j++) {
+      g.addTri(c0, rings[0][j + 1], rings[0][j]);
+    }
+  }
+  if (capEnd) {
+    const k = n - 1;
+    const c1 = g.addVertex(path[k][0], path[k][1], path[k][2], dirs[k][0], dirs[k][1], dirs[k][2]);
+    for (let j = 0; j < seg; j++) {
+      g.addTri(c1, rings[k][j], rings[k][j + 1]);
+    }
+  }
+  return g;
+}
+
+// 平面着色：把索引网格展开为逐面顶点 + 面法线（低多边形岩石用它最好看）
+function flatShade(g) {
+  const out = new Geometry();
+  for (let i = 0; i < g.indices.length; i += 3) {
+    const ia = g.indices[i], ib = g.indices[i + 1], ic = g.indices[i + 2];
+    const a = [g.positions[ia * 3], g.positions[ia * 3 + 1], g.positions[ia * 3 + 2]];
+    const b = [g.positions[ib * 3], g.positions[ib * 3 + 1], g.positions[ib * 3 + 2]];
+    const c = [g.positions[ic * 3], g.positions[ic * 3 + 1], g.positions[ic * 3 + 2]];
+    const n = norm3(cross3([b[0] - a[0], b[1] - a[1], b[2] - a[2]],
+      [c[0] - a[0], c[1] - a[1], c[2] - a[2]]));
+    for (const p of [a, b, c]) {
+      out.addVertex(p[0], p[1], p[2], n[0], n[1], n[2]);
+    }
+  }
+  return out;
+}
+
+// 低多边形岩石：低分段球 + 低频隆起 + 平面着色 → 有棱角感的石头
+function makeRock(rx, ry, rz, lump, seed) {
+  const g = makeSphere(6, 9);
+  for (let i = 0; i < g.vertCount(); i++) {
+    const ix = i * 3;
+    const x = g.positions[ix], y = g.positions[ix + 1], z = g.positions[ix + 2];
+    const f = 1 + lump * (
+      Math.sin(x * 3.1 + seed) * 0.5 +
+      Math.sin(y * 4.3 + seed * 1.7) * 0.3 +
+      Math.sin(z * 2.7 + seed * 2.3) * 0.35);
+    g.positions[ix] = x * rx * f;
+    g.positions[ix + 1] = y * ry * f;
+    g.positions[ix + 2] = z * rz * f;
+  }
+  return flatShade(g);
+}
+
+// 扫掠机翼：沿 +X 伸展的扁平透镜形，带后掠与弦长/厚度渐变。
+// mirror=true 时镜像到 -X（左右翼各一份网格，避免用负缩放翻转面朝向）。
+function makeWingLens(len, chordRoot, chordTip, sweepBack, thickRoot, thickTip,
+  tSeg = 12, aSeg = 12, mirror = false) {
+  const g = new Geometry();
+  const sx = mirror ? -1 : 1;
+  const eps = 1e-3;
+  const P = (t, th) => {
+    const tc = Math.min(1, Math.max(0, t));
+    const chord = chordRoot + (chordTip - chordRoot) * tc;
+    const thick = thickRoot + (thickTip - thickRoot) * tc;
+    const c = Math.cos(th), s = Math.sin(th);
+    return [
+      sx * tc * len,
+      0.5 * thick * s,
+      -sweepBack * tc + 0.5 * chord * c,
+    ];
+  };
+  const normAt = (t, th) => {
+    const p0 = P(t + eps, th), p1 = P(t - eps, th);
+    const q0 = P(t, th + eps), q1 = P(t, th - eps);
+    const dt = [p0[0] - p1[0], p0[1] - p1[1], p0[2] - p1[2]];
+    const dth = [q0[0] - q1[0], q0[1] - q1[1], q0[2] - q1[2]];
+    const n = cross3(dth, dt);
+    return norm3([n[0] * sx, n[1] * sx, n[2] * sx]);
+  };
+  const rings = [];
+  for (let i = 0; i <= tSeg; i++) {
+    const t = i / tSeg;
+    const ring = [];
+    for (let j = 0; j <= aSeg; j++) {
+      const th = j * 2 * Math.PI / aSeg;
+      const p = P(t, th);
+      const n = normAt(t, th);
+      ring.push(g.addVertex(p[0], p[1], p[2], n[0], n[1], n[2]));
+    }
+    rings.push(ring);
+  }
+  for (let i = 0; i < tSeg; i++) {
+    for (let j = 0; j < aSeg; j++) {
+      const a = rings[i][j], b = rings[i][j + 1];
+      const c = rings[i + 1][j], d = rings[i + 1][j + 1];
+      g.addTri(a, c, d);
+      g.addTri(a, d, b);
+    }
+  }
+  return g;
+}
+
+function cross3(a, b) {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+}
+function norm3(a) {
+  const L = Math.hypot(a[0], a[1], a[2]) || 1;
+  return [a[0] / L, a[1] / L, a[2] / L];
 }
 
 // 长方体（中心在原点），带正确面法线
@@ -253,7 +456,7 @@ const MAT_GROUND = 0, MAT_STONE = 1, MAT_THORAX = 2, MAT_ABDOMEN = 3, MAT_HEAD =
   MAT_CROWN_DARK = 14, MAT_CROWN_LIGHT = 15, MAT_FRUIT = 16, MAT_SUN = 17,
   MAT_MOON = 18, MAT_STAR = 19, MAT_FROG_BODY = 20, MAT_FROG_EYE = 21,
   MAT_FROG_TONGUE = 22, MAT_FX_PLUS = 23, MAT_FX_WIND = 24, MAT_FX_RIPPLE = 25,
-  MAT_PATH_DOT = 26;
+  MAT_PATH_DOT = 26, MAT_ABDOMEN_BAND = 27, MAT_RIVER_BED = 28, MAT_WATER_SHALLOW = 29;
 const materials = [
   { name: 'ground', baseColor: srgb2lin(0x5f8f4c), roughness: 0.95 },
   { name: 'stone', baseColor: srgb2lin(0x8f8d85), roughness: 0.9 },
@@ -283,6 +486,9 @@ const materials = [
   { name: 'fx_wind', baseColor: lin4(0xffffff, 0.34), roughness: 1.0, alphaMode: 'BLEND' },
   { name: 'fx_ripple', baseColor: lin4(0xffffff, 0.5), roughness: 1.0, alphaMode: 'BLEND' },
   { name: 'path_dot', baseColor: lin4(0xfff3c4, 0.85), roughness: 1.0, emissive: [0.6, 0.55, 0.3] },
+  { name: 'abdomen_band', baseColor: srgb2lin(0x5a3a1c), roughness: 0.8 },
+  { name: 'river_bed', baseColor: srgb2lin(0x6b6350), roughness: 0.95 },
+  { name: 'water_shallow', baseColor: lin4(0x6fa8e0, 0.55), roughness: 0.2, alphaMode: 'BLEND' },
 ];
 
 // ---------- 组装几何与节点 ----------
@@ -309,19 +515,26 @@ function addNode(node, top = false) {
   addNode({ name: 'ground_inner', mesh: addMesh(inner, MAT_GROUND_INNER) }, true);
 }
 
-// ==== 2) 场内石块 ====
+// ==== 2) 场内石块（v3：3 种带棱角的低多边形岩石，随机朝向与比例，半埋入地面） ====
 {
-  const m = addMesh(makeEllipsoid(0.5, 0.30, 0.42, 0, 0, 0, 10, 14), MAT_STONE);
+  const rockMeshes = [
+    addMesh(makeRock(0.50, 0.32, 0.44, 0.22, 1.7), MAT_STONE),
+    addMesh(makeRock(0.44, 0.38, 0.50, 0.26, 4.1), MAT_STONE),
+    addMesh(makeRock(0.58, 0.26, 0.40, 0.18, 8.3), MAT_STONE),
+  ];
   const stonePos = [
     [2.7, 0.9, 0.75], [3.6, -1.7, 0.95], [-3.1, 1.4, 0.85],
     [-4.1, -1.1, 0.7], [1.3, -3.4, 0.65], [-1.8, 3.3, 0.9],
     [4.4, 2.2, 0.8], [-3.9, 3.8, 0.6],
   ]; // [x, z, scale]
+  const rng = makeRng(0x5709ee);
   for (let i = 0; i < stonePos.length; i++) {
     const s = stonePos[i];
     addNode({
-      name: `stone_${i}`, mesh: m,
-      translation: [s[0], 0.30 * s[2] * 0.55, s[1]], scale: [s[2], s[2] * 1.6, s[2]],
+      name: `stone_${i}`, mesh: rockMeshes[i % rockMeshes.length],
+      translation: [s[0], 0.20 * s[2], s[1]],
+      rotation: quatMul(quatY(rng() * Math.PI * 2), quatZ((rng() - 0.5) * 0.35)),
+      scale: [s[2] * (0.9 + rng() * 0.25), s[2] * (0.75 + rng() * 0.4), s[2] * (0.9 + rng() * 0.25)],
     }, true);
   }
 }
@@ -333,29 +546,44 @@ function addNode(node, top = false) {
 const RIVER_A0 = 20 * DEG, RIVER_A1 = 108 * DEG;
 const RIVER_RIN = 4.9, RIVER_ROUT = 6.6;
 {
-  const water = bakeTransform(makeArcBand(RIVER_RIN, RIVER_ROUT, RIVER_A0, RIVER_A1, 30),
+  // v3：河床（泥土带）+ 浅水圈 + 主水面，三层叠出河道的纵深感
+  const bed = bakeTransform(
+    makeArcBand(RIVER_RIN - 0.32, RIVER_ROUT + 0.48, RIVER_A0 - 0.045, RIVER_A1 + 0.045, 36),
+    { x: 0, y: 0, z: 0, w: 1 }, [1, 1, 1], [0, 0.004, 0]);
+  addNode({ name: 'river_bed', mesh: addMesh(bed, MAT_RIVER_BED) }, true);
+
+  const shallow = bakeTransform(
+    makeArcBand(RIVER_RIN, RIVER_RIN + 0.34, RIVER_A0, RIVER_A1, 30),
+    { x: 0, y: 0, z: 0, w: 1 }, [1, 1, 1], [0, 0.009, 0]);
+  addNode({ name: 'river_shallow', mesh: addMesh(shallow, MAT_WATER_SHALLOW) }, true);
+
+  // 主水面：高度与 EnvironmentController.riverY 一致（乘波时会整体起伏）
+  const water = bakeTransform(makeArcBand(RIVER_RIN, RIVER_ROUT, RIVER_A0, RIVER_A1, 32),
     { x: 0, y: 0, z: 0, w: 1 }, [1, 1, 1], [0, 0.012, 0]);
   addNode({ name: 'river', mesh: addMesh(water, MAT_WATER) }, true);
 
-  // 两侧鹅卵石（外白灰椭球，随机缩放）
+  // 两侧鹅卵石：贴岸分布，大小/朝向/比例随机，用低多边形岩石更自然
   const rng = makeRng(0x51ee01);
-  const stoneMesh = addMesh(makeEllipsoid(0.16, 0.10, 0.13, 0, 0, 0, 8, 12), MAT_BANK_STONE);
+  const pebbleMeshes = [
+    addMesh(makeRock(0.17, 0.11, 0.14, 0.16, 2.9), MAT_BANK_STONE),
+    addMesh(makeRock(0.13, 0.10, 0.16, 0.20, 6.4), MAT_BANK_STONE),
+  ];
   const bankSpecs = [
-    { r: RIVER_RIN - 0.12, n: 8 },
-    { r: RIVER_ROUT + 0.12, n: 8 },
+    { r: RIVER_RIN - 0.14, n: 8 },
+    { r: RIVER_ROUT + 0.14, n: 8 },
   ];
   let k = 0;
   for (const spec of bankSpecs) {
     for (let i = 0; i < spec.n; i++) {
       const t = (i + 0.5) / spec.n;
       const a = RIVER_A0 + (RIVER_A1 - RIVER_A0) * t;
-      const jitterR = spec.r + (rng() - 0.5) * 0.18;
-      const s = 0.7 + rng() * 0.8;
+      const jitterR = spec.r + (rng() - 0.5) * 0.20;
+      const s = 0.65 + rng() * 0.85;
       addNode({
-        name: `river_bank_stone_${k}`, mesh: stoneMesh,
-        translation: [jitterR * Math.cos(a), 0.05 * s, jitterR * Math.sin(a)],
-        rotation: quatY(rng() * Math.PI * 2),
-        scale: [s, s, s],
+        name: `river_bank_stone_${k}`, mesh: pebbleMeshes[k % pebbleMeshes.length],
+        translation: [jitterR * Math.cos(a), 0.035 * s, jitterR * Math.sin(a)],
+        rotation: quatMul(quatY(rng() * Math.PI * 2), quatZ((rng() - 0.5) * 0.4)),
+        scale: [s * (0.85 + rng() * 0.3), s * (0.7 + rng() * 0.4), s * (0.85 + rng() * 0.3)],
       }, true);
       k++;
     }
@@ -363,41 +591,80 @@ const RIVER_RIN = 4.9, RIVER_ROUT = 6.6;
 }
 
 // ==== 4) 树木 ×3：tree_i（根）→ trunk（一级摇摆）→ crown（二级摇摆） ====
+// v3：树干改扫掠管（带锥度与轻微倾斜）+ 3 根烘进树干的枝条；树冠改 6 层错落叶球。
 // 位置在场地边缘外一圈；其中 0 号树挨着河岸。
 const TREE_SPECS = [
-  { x: 5.0 * Math.cos(14 * DEG), z: 5.0 * Math.sin(14 * DEG), h: 1.30, s: 1.0 },
-  { x: 5.6 * Math.cos(150 * DEG), z: 5.6 * Math.sin(150 * DEG), h: 1.10, s: 0.9 },
-  { x: 5.3 * Math.cos(250 * DEG), z: 5.3 * Math.sin(250 * DEG), h: 1.22, s: 0.95 },
+  { x: 5.0 * Math.cos(14 * DEG), z: 5.0 * Math.sin(14 * DEG), h: 1.30, s: 1.00, lean: 0.10 },
+  { x: 5.6 * Math.cos(150 * DEG), z: 5.6 * Math.sin(150 * DEG), h: 1.10, s: 0.90, lean: -0.08 },
+  { x: 5.3 * Math.cos(250 * DEG), z: 5.3 * Math.sin(250 * DEG), h: 1.22, s: 0.95, lean: 0.05 },
 ];
 {
-  const crownDark = addMesh(makeEllipsoid(0.46, 0.36, 0.46, 0, 0, 0, 12, 16), MAT_CROWN_DARK);
-  const crownLight = addMesh(makeEllipsoid(0.34, 0.28, 0.34, 0, 0, 0, 12, 16), MAT_CROWN_LIGHT);
-  const fruitMesh = addMesh(makeEllipsoid(0.055, 0.055, 0.055, 0, 0, 0, 8, 10), MAT_FRUIT);
+  const crownDark = addMesh(makeEllipsoid(0.40, 0.32, 0.40, 0, 0, 0, 14, 18), MAT_CROWN_DARK);
+  const crownLight = addMesh(makeEllipsoid(0.31, 0.26, 0.31, 0, 0, 0, 14, 18), MAT_CROWN_LIGHT);
+  const fruitMesh = addMesh(makeEllipsoid(0.055, 0.055, 0.055, 0, 0, 0, 10, 12), MAT_FRUIT);
   const rng = makeRng(0x7ee501);
 
   let fruitIdx = 0;
   for (let ti = 0; ti < TREE_SPECS.length; ti++) {
     const spec = TREE_SPECS[ti];
-    // 树干网格按实际高度烘焙 ⇒ 节点无需缩放，子节点（树冠）的位移就是真实米数
-    const trunkMesh = addMesh(makeCylinderUp(0.055, 0.095, spec.h, 12), MAT_TRUNK);
-    // 树冠：2 深 1 浅错位堆叠
-    const crownChildren = [
-      addNode({ name: `crown_${ti}_dark_a`, mesh: crownDark, translation: [0, 0.30, 0], scale: [spec.s, spec.s, spec.s] }),
-      addNode({ name: `crown_${ti}_dark_b`, mesh: crownDark, translation: [0.22 * spec.s, 0.52, -0.14 * spec.s], scale: [0.82 * spec.s, 0.78 * spec.s, 0.82 * spec.s] }),
-      addNode({ name: `crown_${ti}_light`, mesh: crownLight, translation: [-0.18 * spec.s, 0.62, 0.16 * spec.s], scale: [spec.s, spec.s, spec.s] }),
+    const h = spec.h, lean = spec.lean;
+    // 树干：底部贴地、向上渐细并轻微倾斜（高度烘焙进网格 ⇒ 节点无 scale，
+    // 否则作为子节点的树冠会被一起缩放 —— 见易错总结第 27 条）
+    const trunkMesh = addMesh(makeTube(
+      [[0, 0, 0], [lean * 0.45, h * 0.5, 0], [lean, h, 0]],
+      [0.115, 0.072, 0.040], 12, true, true), MAT_TRUNK);
+
+    // 枝条 ×3：挂在树干下随树干一起摆
+    const branchChildren = [];
+    const branches = [
+      { from: [0.02, h * 0.60, 0.00], to: [0.34 * spec.s, h * 1.02, 0.16 * spec.s] },
+      { from: [-0.02, h * 0.68, 0.03], to: [-0.30 * spec.s, h * 1.08, -0.18 * spec.s] },
+      { from: [0.00, h * 0.74, -0.02], to: [0.10 * spec.s, h * 1.16, -0.30 * spec.s] },
     ];
+    for (let bi = 0; bi < branches.length; bi++) {
+      const b = branches[bi];
+      const path = [[0, 0, 0],
+        [(b.to[0] - b.from[0]) * 0.5, (b.to[1] - b.from[1]) * 0.5, (b.to[2] - b.from[2]) * 0.5],
+        [b.to[0] - b.from[0], b.to[1] - b.from[1], b.to[2] - b.from[2]]];
+      branchChildren.push(addNode({
+        name: `branch_${ti}_${bi}`,
+        mesh: addMesh(makeTube(path, [0.048, 0.030, 0.016], 8, true, true), MAT_TRUNK),
+        translation: b.from,
+      }));
+    }
+
+    // 树冠：6 个错落叶球（深绿底 + 浅绿受光面），每棵树用不同随机相位
+    const crownChildren = [];
+    for (let ci = 0; ci < 6; ci++) {
+      const ang = ci * Math.PI * 2 / 6 + rng() * 0.8;
+      const rad = (0.14 + rng() * 0.20) * spec.s;
+      const y = (0.16 + rng() * 0.44) * spec.s;
+      const sc = (0.62 + rng() * 0.5) * spec.s;
+      const light = ci % 2 === 1;
+      crownChildren.push(addNode({
+        name: `crown_${ti}_blob_${ci}`,
+        mesh: light ? crownLight : crownDark,
+        translation: [rad * Math.cos(ang), y, rad * Math.sin(ang)],
+        scale: [sc, sc * (0.82 + rng() * 0.3), sc],
+        rotation: quatY(rng() * Math.PI),
+      }));
+    }
     // 果实 ×3 挂在树冠表面（兼作食物彩蛋）
     for (let f = 0; f < 3; f++) {
       const a = rng() * Math.PI * 2;
       crownChildren.push(addNode({
         name: `fruit_${fruitIdx}`, mesh: fruitMesh,
-        translation: [0.42 * spec.s * Math.cos(a), 0.28 + 0.34 * rng(), 0.42 * spec.s * Math.sin(a)],
+        translation: [0.40 * spec.s * Math.cos(a), (0.24 + 0.40 * rng()) * spec.s, 0.40 * spec.s * Math.sin(a)],
       }));
       fruitIdx++;
     }
-    // 层级：tree_i（根部）→ trunk（一级摇摆，网格底贴地 ⇒ 绕根部摆）→ crown（二级摇摆）
-    const crown = addNode({ name: `crown_${ti}`, translation: [0, spec.h, 0], children: crownChildren });
-    const trunk = addNode({ name: `trunk_${ti}`, mesh: trunkMesh, children: [crown] });
+
+    // 层级：tree_i（根部）→ trunk（一级摇摆，绕根部）→ crown（二级摇摆）
+    // 枝条的坐标是相对"树根"写的，所以必须挂在 trunk 下（crown 已被抬到 y=h，不能复用这份坐标）
+    const crown = addNode({ name: `crown_${ti}`, translation: [lean, h, 0], children: crownChildren });
+    const trunk = addNode({
+      name: `trunk_${ti}`, mesh: trunkMesh, children: [crown].concat(branchChildren),
+    });
     addNode({ name: `tree_${ti}`, translation: [spec.x, 0, spec.z], children: [trunk] }, true);
   }
 }
@@ -435,7 +702,8 @@ const TREE_SPECS = [
 }
 
 // ==== 7) 青蛙（含可伸缩舌头） ====
-// 蹲坐在河流内侧岸边；朝向场地中心（由生成期烘焙的 yaw 承担）
+// v3：身体改旋转体剖面（臀宽头窄）+ 纵向压缩，加咽喉囊、突出大眼、鼻孔、
+//     两段折腿与后肢蹼足。蹲坐在河流内侧岸边；朝向场地中心（生成期烘焙 yaw）。
 const FROG_R = 4.55, FROG_A = 64 * DEG;
 {
   const fx = FROG_R * Math.cos(FROG_A), fz = FROG_R * Math.sin(FROG_A);
@@ -443,94 +711,245 @@ const FROG_R = 4.55, FROG_A = 64 * DEG;
   const yaw = Math.atan2(-fx, -fz);
   const qFrog = quatY(yaw);
 
-  const bodyMesh = addMesh(makeEllipsoid(0.34, 0.26, 0.42, 0, 0.26, 0, 12, 16), MAT_FROG_BODY);
-  const eyeMesh = addMesh(makeEllipsoid(0.095, 0.105, 0.095, 0, 0, 0, 8, 12), MAT_FROG_EYE);
-  const pupilMesh = addMesh(makeEllipsoid(0.045, 0.05, 0.045, 0, 0, 0, 6, 10), MAT_LEG);
-  const legMesh = addMesh(makeCylinder(0.045, 0.06, 1, 8, true, true), MAT_FROG_BODY);
+  // 纵向压扁（青蛙又宽又扁）：位置 y*=k，法线 ny/=k 再归一化（对角缩放的逆转置）
+  const squashY = (g, k) => {
+    for (let i = 0; i < g.vertCount(); i++) {
+      const ix = i * 3;
+      g.positions[ix + 1] *= k;
+      g.normals[ix + 1] /= k;
+      const nl = Math.hypot(g.normals[ix], g.normals[ix + 1], g.normals[ix + 2]) || 1;
+      g.normals[ix] /= nl; g.normals[ix + 1] /= nl; g.normals[ix + 2] /= nl;
+    }
+    return g;
+  };
+
+  // 身体：吻端（+Z）→ 臀部（-Z），臀宽头窄
+  const bodyProfile = makeProfile([
+    [0.30, 0.000], [0.27, 0.075], [0.21, 0.140], [0.12, 0.195],
+    [0.00, 0.232], [-0.14, 0.238], [-0.28, 0.190], [-0.40, 0.080], [-0.44, 0.000],
+  ]);
+  const bodyMesh = addMesh(
+    squashY(bakeTransform(makeRevolutionZ(bodyProfile, 26, 22),
+      { x: 0, y: 0, z: 0, w: 1 }, [1, 1, 1], [0, 0.215, 0]), 0.78), MAT_FROG_BODY);
+  // 咽喉囊（下颌处浅色鼓包）
+  const throatMesh = addMesh(makeEllipsoid(0.145, 0.075, 0.150, 0, 0.115, 0.145, 14, 18), MAT_FROG_EYE);
+  // 眼球（凸出于头顶）
+  const eyeMesh = addMesh(makeEllipsoid(0.088, 0.092, 0.088, 0, 0, 0, 14, 18), MAT_FROG_EYE);
+  // 瞳孔：竖向椭圆（蛙类特征）
+  const pupilMesh = addMesh(makeEllipsoid(0.030, 0.052, 0.030, 0, 0, 0, 10, 12), MAT_LEG);
+  // 腿：用扫掠管做两段折腿
   const tongueMesh = addMesh(makeTongueUnit(0.05), MAT_FROG_TONGUE);
+  // 蹼足：一片扁三角
+  const webMesh = addMesh(makeBox(0.16, 0.014, 0.13), MAT_FROG_BODY);
 
   const frogChildren = [];
   frogChildren.push(addNode({ name: 'frog_body', mesh: bodyMesh }));
-  // 眼球 + 瞳孔（瞳孔是独立节点，便于"转向果蝇"时只动瞳孔）
-  frogChildren.push(addNode({ name: 'frog_eye_l', mesh: eyeMesh, translation: [-0.17, 0.50, 0.16] }));
-  frogChildren.push(addNode({ name: 'frog_eye_r', mesh: eyeMesh, translation: [0.17, 0.50, 0.16] }));
-  frogChildren.push(addNode({ name: 'frog_pupil_l', mesh: pupilMesh, translation: [-0.20, 0.53, 0.235] }));
-  frogChildren.push(addNode({ name: 'frog_pupil_r', mesh: pupilMesh, translation: [0.14, 0.53, 0.235] }));
-  // 四条折腿（前二后二）
-  const legSpecs = [
-    { sx: -1, z: 0.30 }, { sx: 1, z: 0.30 }, { sx: -1, z: -0.26 }, { sx: 1, z: -0.26 },
+  frogChildren.push(addNode({ name: 'frog_throat', mesh: throatMesh }));
+  // 眼球 + 瞳孔（瞳孔是独立节点：控制器在蓄力时前移、眨眼时隐藏）
+  frogChildren.push(addNode({ name: 'frog_eye_l', mesh: eyeMesh, translation: [-0.145, 0.315, 0.145] }));
+  frogChildren.push(addNode({ name: 'frog_eye_r', mesh: eyeMesh, translation: [0.145, 0.315, 0.145] }));
+  frogChildren.push(addNode({ name: 'frog_pupil_l', mesh: pupilMesh, translation: [-0.150, 0.330, 0.212] }));
+  frogChildren.push(addNode({ name: 'frog_pupil_r', mesh: pupilMesh, translation: [0.140, 0.330, 0.212] }));
+  // 鼻孔 ×2
+  const nostrilMesh = addMesh(makeEllipsoid(0.014, 0.014, 0.014, 0, 0, 0, 8, 10), MAT_LEG);
+  frogChildren.push(addNode({ name: 'frog_nostril_l', mesh: nostrilMesh, translation: [-0.048, 0.185, 0.268] }));
+  frogChildren.push(addNode({ name: 'frog_nostril_r', mesh: nostrilMesh, translation: [0.048, 0.185, 0.268] }));
+
+  // 前肢 ×2（较短，支撑上身）：基节 → 腕 → 掌
+  const frontLegs = [
+    { sx: -1, base: [-0.185, 0.170, 0.150], mid: [-0.235, 0.075, 0.205], foot: [-0.250, 0.010, 0.255] },
+    { sx: 1, base: [0.185, 0.170, 0.150], mid: [0.235, 0.075, 0.205], foot: [0.250, 0.010, 0.255] },
   ];
-  for (let i = 0; i < legSpecs.length; i++) {
-    const L = legSpecs[i];
-    const start = [L.sx * 0.24, 0.20, L.z];
-    const end = [L.sx * 0.40, 0.0, L.z + (L.z > 0 ? 0.12 : -0.10)];
-    const dir = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
-    const len = Math.hypot(...dir);
+  for (let i = 0; i < frontLegs.length; i++) {
+    const L = frontLegs[i];
+    const path = [[0, 0, 0],
+      [L.mid[0] - L.base[0], L.mid[1] - L.base[1], L.mid[2] - L.base[2]],
+      [L.foot[0] - L.base[0], L.foot[1] - L.base[1], L.foot[2] - L.base[2]]];
     frogChildren.push(addNode({
-      name: `frog_leg_${i}`, mesh: legMesh,
-      translation: start, rotation: quatBetween([0, 1, 0], dir), scale: [1, len, 1],
+      name: `frog_leg_front_${i}`, mesh: addMesh(makeTube(path, [0.055, 0.036, 0.030], 9, true, true), MAT_FROG_BODY),
+      translation: L.base,
     }));
   }
-  // 舌头：挂在与嘴同高的位置，沿本地 +Z 伸缩（base 固定、末端伸出）
-  frogChildren.push(addNode({ name: 'frog_tongue', mesh: tongueMesh, translation: [0, 0.26, 0.34] }));
+  // 后肢 ×2（粗壮、折叠成 Z 形，是青蛙的辨识特征）
+  const hindLegs = [
+    { sx: -1, base: [-0.190, 0.215, -0.190], kneeA: [-0.330, 0.185, -0.330], kneeB: [-0.300, 0.070, -0.080], foot: [-0.320, 0.010, -0.330] },
+    { sx: 1, base: [0.190, 0.215, -0.190], kneeA: [0.330, 0.185, -0.330], kneeB: [0.300, 0.070, -0.080], foot: [0.320, 0.010, -0.330] },
+  ];
+  for (let i = 0; i < hindLegs.length; i++) {
+    const L = hindLegs[i];
+    const path = [[0, 0, 0],
+      [L.kneeA[0] - L.base[0], L.kneeA[1] - L.base[1], L.kneeA[2] - L.base[2]],
+      [L.kneeB[0] - L.base[0], L.kneeB[1] - L.base[1], L.kneeB[2] - L.base[2]],
+      [L.foot[0] - L.base[0], L.foot[1] - L.base[1], L.foot[2] - L.base[2]]];
+    frogChildren.push(addNode({
+      name: `frog_leg_hind_${i}`, mesh: addMesh(makeTube(path, [0.075, 0.052, 0.040, 0.032], 10, true, true), MAT_FROG_BODY),
+      translation: L.base,
+    }));
+    // 蹼足
+    frogChildren.push(addNode({
+      name: `frog_web_${i}`, mesh: webMesh,
+      translation: [L.foot[0], 0.008, L.foot[2]],
+      rotation: quatY(L.sx > 0 ? -0.35 : 0.35),
+    }));
+  }
+
+  // 舌头：挂在与嘴同高的位置，沿本地 +Z 伸缩（底面固定在 z=0，运行时 scale.z 伸长）
+  frogChildren.push(addNode({ name: 'frog_tongue', mesh: tongueMesh, translation: [0, 0.150, 0.300] }));
 
   addNode({ name: 'frog', translation: [fx, 0, fz], rotation: qFrog, children: frogChildren }, true);
 }
 
 // ==== 8) 果蝇（朝 +Z，根节点在地面） ====
+// v3：躯干/头改用旋转体剖面（腰部收窄、腹部蛋形收尾），腹部加 4 道背板环，
+//     复眼加大并外扩，加单眼 ×3、平衡棒 ×2、背刚毛 ×8，腿改两段折腿，翅膀改扫掠透镜形。
 const flyChildren = [];
 // 头部轴心（颈部）：head/复眼/触角都挂在这下面，进食时整体低头
 const HEAD_PIVOT = [0, 0.345, 0.19];
 {
-  let m = addMesh(makeEllipsoid(0.14, 0.13, 0.20, 0, 0.30, 0.02, 12, 18), MAT_THORAX);
+  // —— 胸部（旋转体，前端接到颈部、后端收成腰）——
+  const thoraxProfile = makeProfile([
+    [0.17, 0.058], [0.10, 0.104], [0.02, 0.126], [-0.04, 0.110], [-0.09, 0.068], [-0.105, 0.030],
+  ]);
+  let m = addMesh(bakeTransform(makeRevolutionZ(thoraxProfile, 26, 20),
+    { x: 0, y: 0, z: 0, w: 1 }, [1, 1, 1], [0, 0.300, 0]), MAT_THORAX);
   flyChildren.push(addNode({ name: 'thorax', mesh: m }));
-  m = addMesh(makeEllipsoid(0.115, 0.105, 0.23, 0, 0.285, -0.30, 12, 18), MAT_ABDOMEN);
-  flyChildren.push(addNode({ name: 'abdomen', mesh: m }));
-
-  // —— 头部组（相对 head_pivot 的偏移）——
-  const headChildren = [];
-  m = addMesh(makeEllipsoid(0.105, 0.105, 0.10, 0, 0.335, 0.245, 10, 16), MAT_HEAD);
-  headChildren.push(addNode({ name: 'head', mesh: m, translation: [0, 0.335 - HEAD_PIVOT[1], 0.245 - HEAD_PIVOT[2]] }));
-  m = addMesh(makeEllipsoid(0.052, 0.062, 0.070, 0, 0, 0, 8, 12), MAT_EYE);
-  headChildren.push(addNode({ name: 'eye_left', mesh: m, translation: [-0.062, 0.36 - HEAD_PIVOT[1], 0.285 - HEAD_PIVOT[2]] }));
-  headChildren.push(addNode({ name: 'eye_right', mesh: m, translation: [0.062, 0.36 - HEAD_PIVOT[1], 0.285 - HEAD_PIVOT[2]] }));
-  m = addMesh(makeCylinder(0.004, 0.007, 1, 6, true, true), MAT_LEG);
-  const antL = { start: [-0.03, 0.42, 0.30], end: [-0.10, 0.50, 0.42] };
-  const antR = { start: [0.03, 0.42, 0.30], end: [0.10, 0.50, 0.42] };
-  for (const [i, a] of [[0, antL], [1, antR]]) {
-    const dir = [a.end[0] - a.start[0], a.end[1] - a.start[1], a.end[2] - a.start[2]];
-    const len = Math.hypot(...dir);
-    const q = quatBetween([0, 1, 0], dir);
-    headChildren.push(addNode({
-      name: i === 0 ? 'antenna_left' : 'antenna_right', mesh: m,
-      translation: [a.start[0] - HEAD_PIVOT[0], a.start[1] - HEAD_PIVOT[1], a.start[2] - HEAD_PIVOT[2]],
-      rotation: [q.x, q.y, q.z, q.w], scale: [1, len, 1],
-    }));
-  }
-  flyChildren.push(addNode({ name: 'head_pivot', translation: HEAD_PIVOT, children: headChildren }));
-
-  // 腿 ×6
-  m = addMesh(makeCylinder(0.010, 0.014, 1, 8, true, true), MAT_LEG);
-  const legs = [
-    { sz: 0.12, ox: 0.15, ez: 0.16 }, { sz: 0.00, ox: 0.19, ez: 0.02 }, { sz: -0.10, ox: 0.15, ez: -0.14 },
-  ];
-  for (const side of [-1, 1]) {
-    for (const L of legs) {
-      const start = [side * 0.10, 0.24, L.sz];
-      const end = [side * L.ox, 0.0, L.ez];
-      const dir = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
-      const len = Math.hypot(...dir);
-      const q = quatBetween([0, 1, 0], dir);
+  // 小盾片（胸部背面的小鼓包）
+  m = addMesh(makeEllipsoid(0.052, 0.030, 0.046, 0, 0.396, -0.072, 12, 16), MAT_THORAX);
+  flyChildren.push(addNode({ name: 'scutellum', mesh: m }));
+  // 平衡棒 ×2（果蝇标志性器官：翅膀退化成的小棒）
+  m = addMesh(makeEllipsoid(0.030, 0.012, 0.012, 0, 0, 0, 8, 10), MAT_HEAD);
+  flyChildren.push(addNode({ name: 'haltere_l', mesh: m, translation: [-0.072, 0.330, -0.062], rotation: quatY(-0.5) }));
+  flyChildren.push(addNode({ name: 'haltere_r', mesh: m, translation: [0.072, 0.330, -0.062], rotation: quatY(0.5) }));
+  // 背刚毛 ×8（细锥，插在胸部背面）
+  {
+    const bristleMesh = addMesh(makeTube([[0, 0, 0], [0, 0.030, -0.008], [0, 0.052, -0.016]],
+      [0.0060, 0.0035, 0.0010], 6, true, true), MAT_LEG);
+    const spots = [
+      [-0.045, 0.386, 0.055], [0.045, 0.386, 0.055],
+      [-0.062, 0.386, -0.005], [0.062, 0.386, -0.005],
+      [-0.040, 0.392, -0.055], [0.040, 0.392, -0.055],
+      [-0.016, 0.400, -0.010], [0.016, 0.400, -0.010],
+    ];
+    for (let i = 0; i < spots.length; i++) {
+      const s = spots[i];
+      const tilt = quatMul(quatZ(s[0] < 0 ? 0.35 : -0.35), quatX(-0.28));
       flyChildren.push(addNode({
-        name: `leg_${side < 0 ? 'l' : 'r'}_${L.sz}`, mesh: m,
-        translation: [start[0], start[1], start[2]], rotation: [q.x, q.y, q.z, q.w], scale: [1, len, 1],
+        name: `bristle_${i}`, mesh: bristleMesh, translation: s,
+        rotation: [tilt.x, tilt.y, tilt.z, tilt.w],
       }));
     }
   }
-  // 翅膀：轴心节点（运行时绕 Z 轴摆动）+ 叶片子节点
-  const wingMesh = addMesh(bakeTransform(makeBox(0.34, 0.006, 0.115), { x: 0, y: 0, z: 0, w: 1 }, [1, 1, 1], [0, 0, 0]), MAT_WING);
-  const wingLBlade = addNode({ name: 'wing_blade_l', mesh: wingMesh, translation: [-0.17, 0, 0] });
-  const wingRBlade = addNode({ name: 'wing_blade_r', mesh: wingMesh, translation: [0.17, 0, 0] });
+  // —— 腹部（蛋形旋转体：腰细 → 中段饱满 → 尾端收尖）——
+  const abdomenProfile = makeProfile([
+    [-0.060, 0.000], [-0.075, 0.062], [-0.140, 0.114], [-0.260, 0.126],
+    [-0.380, 0.108], [-0.480, 0.062], [-0.545, 0.000],
+  ]);
+  m = addMesh(bakeTransform(makeRevolutionZ(abdomenProfile, 26, 22),
+    { x: 0, y: 0, z: 0, w: 1 }, [1, 1, 1], [0, 0.288, 0]), MAT_ABDOMEN);
+  flyChildren.push(addNode({ name: 'abdomen', mesh: m }));
+  // 腹部背板环 ×4（略凸起的深色环，做出"分节"观感）
+  {
+    const bands = [[-0.160, 0.116], [-0.250, 0.126], [-0.340, 0.113], [-0.430, 0.086]];
+    const bandMesh = addMesh(bakeTransform(makeRevolutionZ(makeProfile([
+      [-0.013, 0.000], [-0.008, 0.055], [0.000, 0.093], [0.008, 0.055], [0.013, 0.000],
+    ]), 24, 8), { x: 0, y: 0, z: 0, w: 1 }, [1, 1, 1], [0, 0, 0]), MAT_ABDOMEN_BAND);
+    for (let i = 0; i < bands.length; i++) {
+      const r = bands[i][1];
+      flyChildren.push(addNode({
+        name: `abdomen_band_${i}`, mesh: bandMesh,
+        translation: [0, 0.288, bands[i][0]],
+        scale: [(r + 0.004) / 0.093, (r + 0.004) / 0.093, 1],
+      }));
+    }
+  }
+
+  // —— 头部（旋转体）+ 复眼 + 单眼 + 触角 ——
+  const headChildren = [];
+  const headProfile = makeProfile([
+    [0.345, 0.000], [0.322, 0.052], [0.285, 0.084], [0.240, 0.094], [0.195, 0.080], [0.165, 0.000],
+  ]);
+  m = addMesh(bakeTransform(makeRevolutionZ(headProfile, 24, 18),
+    { x: 0, y: 0, z: 0, w: 1 }, [1, 1, 1], [0, 0.335, 0]), MAT_HEAD);
+  headChildren.push(addNode({ name: 'head', mesh: m, translation: [0, 0.335 - HEAD_PIVOT[1], 0 - HEAD_PIVOT[2]] }));
+  // 复眼：贴在头两侧、略向外斜（比 v2 更大，占据头部大半）
+  m = addMesh(makeEllipsoid(0.044, 0.066, 0.068, 0, 0, 0, 14, 18), MAT_EYE);
+  const eyeTiltL = quatMul(quatZ(0.30), quatY(-0.22));
+  headChildren.push(addNode({
+    name: 'eye_left', mesh: m,
+    translation: [-0.058 - HEAD_PIVOT[0], 0.352 - HEAD_PIVOT[1], 0.262 - HEAD_PIVOT[2]],
+    rotation: [eyeTiltL.x, eyeTiltL.y, eyeTiltL.z, eyeTiltL.w],
+  }));
+  const eyeTiltR = quatMul(quatZ(-0.30), quatY(0.22));
+  headChildren.push(addNode({
+    name: 'eye_right', mesh: m,
+    translation: [0.058 - HEAD_PIVOT[0], 0.352 - HEAD_PIVOT[1], 0.262 - HEAD_PIVOT[2]],
+    rotation: [eyeTiltR.x, eyeTiltR.y, eyeTiltR.z, eyeTiltR.w],
+  }));
+  // 单眼 ×3（头顶的三个小亮点）
+  m = addMesh(makeEllipsoid(0.014, 0.014, 0.014, 0, 0, 0, 8, 10), MAT_EYE);
+  const ocelli = [[0, 0.404, 0.286], [-0.030, 0.398, 0.272], [0.030, 0.398, 0.272]];
+  for (let i = 0; i < ocelli.length; i++) {
+    const o = ocelli[i];
+    headChildren.push(addNode({
+      name: `ocellus_${i}`, mesh: m,
+      translation: [o[0] - HEAD_PIVOT[0], o[1] - HEAD_PIVOT[1], o[2] - HEAD_PIVOT[2]],
+    }));
+  }
+  // 触角：两段细管 + 末端小棒（避免单根直棍的塑料感）
+  {
+    const antSpecs = [
+      { name: 'antenna_left', base: [-0.028, 0.406, 0.318], mid: [-0.052, 0.436, 0.372], tip: [-0.070, 0.446, 0.412] },
+      { name: 'antenna_right', base: [0.028, 0.406, 0.318], mid: [0.052, 0.436, 0.372], tip: [0.070, 0.446, 0.412] },
+    ];
+    for (const a of antSpecs) {
+      const path = [[0, 0, 0],
+        [a.mid[0] - a.base[0], a.mid[1] - a.base[1], a.mid[2] - a.base[2]],
+        [a.tip[0] - a.base[0], a.tip[1] - a.base[1], a.tip[2] - a.base[2]]];
+      headChildren.push(addNode({
+        name: a.name, mesh: addMesh(makeTube(path, [0.0085, 0.0055, 0.0042], 8, true, true), MAT_LEG),
+        translation: [a.base[0] - HEAD_PIVOT[0], a.base[1] - HEAD_PIVOT[1], a.base[2] - HEAD_PIVOT[2]],
+      }));
+      headChildren.push(addNode({
+        name: `${a.name}_club`, mesh: addMesh(makeEllipsoid(0.014, 0.013, 0.020, 0, 0, 0, 8, 10), MAT_LEG),
+        translation: [a.tip[0] - HEAD_PIVOT[0], a.tip[1] - HEAD_PIVOT[1], a.tip[2] - HEAD_PIVOT[2]],
+      }));
+    }
+  }
+  // 口器（喙）：头下方一小段，进食低头时更自然
+  headChildren.push(addNode({
+    name: 'proboscis', mesh: addMesh(makeEllipsoid(0.030, 0.038, 0.030, 0, 0, 0, 10, 12), MAT_LEG),
+    translation: [0 - HEAD_PIVOT[0], 0.300 - HEAD_PIVOT[1], 0.286 - HEAD_PIVOT[2]],
+  }));
+  flyChildren.push(addNode({ name: 'head_pivot', translation: HEAD_PIVOT, children: headChildren }));
+
+  // —— 腿 ×6：两段折腿（基节→膝→足），单网格扫掠出折角 ——
+  const legSpecs = [
+    { sz: 0.13, ez: 0.20, ox: 0.19 },   // 前足（朝前）
+    { sz: 0.00, ez: 0.02, ox: 0.23 },   // 中足
+    { sz: -0.10, ez: -0.17, ox: 0.20 }, // 后足
+  ];
+  for (const side of [-1, 1]) {
+    for (let li = 0; li < legSpecs.length; li++) {
+      const L = legSpecs[li];
+      const base = [side * 0.098, 0.238, L.sz];
+      const knee = [side * (L.ox * 0.62), 0.115, L.sz + L.ez * 0.45];
+      const foot = [side * L.ox, 0.0, L.ez];
+      const path = [[0, 0, 0],
+        [knee[0] - base[0], knee[1] - base[1], knee[2] - base[2]],
+        [foot[0] - base[0], foot[1] - base[1], foot[2] - base[2]]];
+      flyChildren.push(addNode({
+        name: `leg_${side < 0 ? 'l' : 'r'}_${li}`,
+        mesh: addMesh(makeTube(path, [0.0180, 0.0105, 0.0070], 9, true, true), MAT_LEG),
+        translation: base,
+      }));
+    }
+  }
+
+  // —— 翅膀：扫掠透镜形（根部宽、翼尖窄并后掠）；左右各一份网格（不用负缩放，避免翻面）——
+  const wingR = addMesh(makeWingLens(0.36, 0.150, 0.058, 0.080, 0.0075, 0.0030, 14, 12, false), MAT_WING);
+  const wingL = addMesh(makeWingLens(0.36, 0.150, 0.058, 0.080, 0.0075, 0.0030, 14, 12, true), MAT_WING);
+  const wingLBlade = addNode({ name: 'wing_blade_l', mesh: wingL, translation: [0, 0, 0] });
+  const wingRBlade = addNode({ name: 'wing_blade_r', mesh: wingR, translation: [0, 0, 0] });
   const wl = addNode({ name: 'wing_left', translation: [-0.09, 0.405, -0.03], children: [wingLBlade] });
   const wr = addNode({ name: 'wing_right', translation: [0.09, 0.405, -0.03], children: [wingRBlade] });
   flyChildren.push(wl, wr);
@@ -672,13 +1091,25 @@ for (const a of check.accessors) {
   if (v.byteOffset + v.byteLength > bufLen) throw new Error('bufferView overflow');
 }
 // 节点树结构打印 + 必备节点名检查（运行时靠 DFS 按名字查找，名字写错会静默失效）
+// 这份清单 = 运行时契约：改模型时**不要**改这些名字，否则功能会无声失效
 const names = new Set(check.nodes.map((n) => n.name));
 const REQUIRED = [
-  'ground', 'ground_inner', 'river', 'river_bank_stone_0', 'river_bank_stone_15',
-  'tree_0', 'tree_1', 'tree_2', 'trunk_0', 'crown_0', 'fruit_0', 'fruit_8',
+  // 场景
+  'ground', 'ground_inner', 'river', 'river_bed', 'river_shallow',
+  'river_bank_stone_0', 'river_bank_stone_15',
+  'stone_0', 'stone_7',
+  // 树木（trunk/crown 是摇摆驱动点）
+  'tree_0', 'tree_1', 'tree_2', 'trunk_0', 'trunk_1', 'trunk_2',
+  'crown_0', 'crown_1', 'crown_2', 'fruit_0', 'fruit_8',
+  // 昼夜
   'sun_pivot', 'sun', 'moon_pivot', 'moon', 'stars', 'star_0', 'star_29',
+  // 青蛙（tongue 伸缩、pupil 蓄力前移与眨眼）
   'frog', 'frog_body', 'frog_tongue', 'frog_eye_l', 'frog_eye_r',
+  'frog_pupil_l', 'frog_pupil_r',
+  // 果蝇（head_pivot 进食低头、wing 拍动）
   'fly', 'head_pivot', 'head', 'wing_left', 'wing_right',
+  'wing_blade_l', 'wing_blade_r', 'eye_left', 'eye_right', 'antenna_left', 'antenna_right',
+  // 交互与特效
   'food_0', 'food_4', 'lightspot',
   'plus_fx_0', 'plus_fx_2', 'wind_line_0', 'wind_line_5', 'ripple_0', 'ripple_2',
   'path_dot_0', 'path_dot_5',

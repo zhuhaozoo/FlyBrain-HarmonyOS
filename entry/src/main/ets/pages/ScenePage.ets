@@ -431,6 +431,13 @@ export struct ScenePage {
     }
   }
 
+  // 点击「投喂」立即在果蝇前方落一份食物（仍可点地面精确指定位置）
+  private feedInFront(): void {
+    const pose = this.brain.getPose();
+    const d = 0.9;
+    this.brain.placeFood(pose.x + Math.sin(pose.yaw) * d, pose.z + Math.cos(pose.yaw) * d);
+  }
+
   private cycleLight(): void {
     this.lightIdx = (this.lightIdx + 1) % 3;
     if (this.lightIdx !== 0) {
@@ -641,6 +648,8 @@ export struct ScenePage {
             .backgroundColor(this.tool === TOOL_FEED ? CHIP_BG_ON : CHIP_BG)
             .onClick(() => {
               this.tool = TOOL_FEED;
+              // 点击即投喂：直接在果蝇前方落一份食物，不必再点场景
+              this.feedInFront();
             })
           Button('聚光').fontSize(12).height(32).layoutWeight(1)
             .backgroundColor(this.tool === TOOL_SPOT ? CHIP_BG_ON : CHIP_BG)
@@ -664,7 +673,7 @@ export struct ScenePage {
               this.cycleLight();
             })
         }.width('100%')
-        Text('投喂/聚光：选工具后点地面放置')
+        Text('点「投喂」立即在果蝇前方放食物；也可选工具后点地面指定位置')
           .fontSize(10).fontColor('#FF6B7A86').width('100%')
       }
     }

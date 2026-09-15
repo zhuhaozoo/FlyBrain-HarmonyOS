@@ -197,7 +197,8 @@ gunzip -k tools/data/coordinates.csv.gz tools/data/classification.csv.gz
 |---|---|
 | [`docs/果蝇大脑App开发文档.md`](docs/果蝇大脑App开发文档.md) | 主文档：背景、方案选型、架构分层、M0~M3 实施记录 |
 | [`docs/ArkTS-ArkUI易错总结.md`](docs/ArkTS-ArkUI易错总结.md) | **强烈推荐阅读**：25 条实战踩坑（编译错误 / 运行时行为 / HDS 组件 / 3D 渲染），每条含「现象 → 原因 → 正确写法」 |
-| [`docs/场景与玩法设计-M4.md`](docs/场景与玩法设计-M4.md) | M4 场景与玩法设计 |
+| [`docs/场景与玩法设计-M4.md`](docs/场景与玩法设计-M4.md) | M4 场景与玩法设计（含实施记录与建模升级说明） |
+| [`docs/生态体系与多智能体设计-M5.md`](docs/生态体系与多智能体设计-M5.md) | M5 设计稿：多果蝇生态、统一大脑挂载、场景切换（**只设计未实现**） |
 
 ---
 
