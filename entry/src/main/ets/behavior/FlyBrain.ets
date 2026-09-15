@@ -78,13 +78,16 @@ export class FlyBrain {
     }
     this.total += dt;
     this.stateTimer += dt;
-    // 死亡期间冻结内驱力与状态机，只跑重生倒计时
-    if (this.state === FlyState.Dead) {
+    // 死亡期间冻结内驱力与状态机，只跑重生倒计时。
+    // 注意：这里必须用 isDead() 而不是 this.state === FlyState.Dead ——
+    // ArkTS 的类型收窄会把 this.state 收窄成"不含 Dead"的联合类型，
+    // 导致函数内后续再比较 FlyState.Dead 时报「两类型无重叠」（易错总结第 28 条）。
+    if (this.isDead()) {
       this.updateDead();
       return;
     }
     this.updateDrives(dt);
-    if (this.state === FlyState.Dead) {
+    if (this.isDead()) {
       return; // updateDrives 里可能因伤害致死
     }
     switch (this.state) {
@@ -205,7 +208,7 @@ export class FlyBrain {
 
   // 死亡到重生的剩余秒数（UI 文案用）
   getRespawnCountdown(): number {
-    if (this.state !== FlyState.Dead) {
+    if (!this.isDead()) {
       return 0;
     }
     return Math.max(0, this.cfg.deathDuration - this.stateTimer);
@@ -237,13 +240,13 @@ export class FlyBrain {
 
   // 被舌头命中：重伤 + 挣脱后起飞逃离
   hitByFrog(): void {
-    if (this.state === FlyState.Dead) {
+    if (this.isDead()) {
       return;
     }
     this.frogThreat = false;
     this.damage(this.cfg.frogHitDamage, FlyDeathCause.Frog);
-    if (this.state === FlyState.Dead) {
-      return;
+    if (this.isDead()) {
+      return; // 这次扑击直接致死
     }
     this.stimulusX = this.pose.x;
     this.stimulusZ = this.pose.z;
@@ -425,13 +428,13 @@ export class FlyBrain {
       const t = (this.hunger - this.cfg.feedLowHunger) /
         Math.max(1e-6, 1 - this.cfg.feedLowHunger);
       this.damage(this.cfg.hpStarveDrain * t * dt, FlyDeathCause.Hunger);
-      if (this.state === FlyState.Dead) {
+      if (this.isDead()) {
         return;
       }
     }
     if (this.isInWater(this.pose.x, this.pose.z)) {
       this.damage(this.cfg.hpWaterDrain * dt, FlyDeathCause.Water);
-      if (this.state === FlyState.Dead) {
+      if (this.isDead()) {
         return;
       }
     }
@@ -738,7 +741,7 @@ export class FlyBrain {
 
   // ---------- M4：伤害 / 治疗 / 死亡 / 重生 ----------
   private damage(amount: number, cause: FlyDeathCause): void {
-    if (this.state === FlyState.Dead) {
+    if (this.isDead()) {
       return;
     }
     this.hp = clamp(this.hp - amount, 0, this.cfg.hpMax);
@@ -748,14 +751,14 @@ export class FlyBrain {
   }
 
   private heal(amount: number): void {
-    if (this.state === FlyState.Dead) {
+    if (this.isDead()) {
       return;
     }
     this.hp = clamp(this.hp + amount, 0, this.cfg.hpMax);
   }
 
   private die(cause: FlyDeathCause): void {
-    if (this.state === FlyState.Dead) {
+    if (this.isDead()) {
       return;
     }
     this.deathCount++;

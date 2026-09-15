@@ -188,7 +188,9 @@ export struct ScenePage {
         this.lastDriveTextMs = now;
         // M4：生命值 / 死亡倒计时同步到 @State（crisis 已在帧循环里即时更新）
         this.hpValue = Math.round(this.brain.getHp());
-        if (st === FlyState.Dead) {
+        // 只比较一次并存成 boolean：避免 ArkTS 对同一联合类型做多次比较时的收窄报错（易错总结第 28 条）
+        const dead = st === FlyState.Dead;
+        if (dead) {
           const cause = FLY_DEATH_NAMES[this.brain.getLastDeathCause()];
           this.deathText = `💀 ${cause} · ${this.brain.getRespawnCountdown().toFixed(1)}s 后重生`;
           // 写入 AppStorage，供「关于」页展示"这只果蝇的一生"
@@ -198,7 +200,7 @@ export struct ScenePage {
           this.deathText = '';
         }
         // 死亡期间整体压暗 10%
-        this.env.setDeathDim(st === FlyState.Dead);
+        this.env.setDeathDim(dead);
         // 轻量成就：连续喂养 3 次 / 完整一轮昼夜零死亡
         if (this.brain.consumeTrustUp()) {
           this.achiText = '🤝 信任+1';

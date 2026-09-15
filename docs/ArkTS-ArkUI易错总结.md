@@ -326,6 +326,56 @@ const trunk = addNode({ name: `trunk_${ti}`, mesh: trunkMesh, children: [crown] 
 
 ---
 
+### 28. 类型收窄会让「第二次比较同一枚举」直接编译报错 ⭐⭐
+
+**现象**：
+```
+10505001 ArkTS Compiler Error
+Error Message: This comparison appears to be unintentional because the types
+'FlyState.Wander | ... | FlyState.Drinking' and 'FlyState.Dead' have no overlap.
+```
+
+**原因**：函数开头写了这样一句之后
+
+```ts
+if (this.state === FlyState.Dead) {
+  this.updateDead();
+  return;
+}
+```
+
+ArkTS 会把 `this.state` **收窄**成「不含 `Dead`」的联合类型。于是后面再写一次
+`if (this.state === FlyState.Dead)` —— **哪怕中间调用了会改变 state 的方法**
+（例如 `this.damage()` 内部可能把状态置为 `Dead`）—— 编译器仍按收窄后的类型
+判定「两类型无重叠」，直接报 10505001。
+
+**正确写法**（二选一）：
+
+```ts
+// 方案 A（推荐）：把判断收进方法 —— 方法调用不参与类型收窄
+private isDead(): boolean {
+  return this.state === FlyState.Dead;
+}
+
+if (this.isDead()) { this.updateDead(); return; }
+this.damage(...);                 // 内部可能致死，但收窄不会发生
+if (this.isDead()) { return; }    // ✅ 合法
+
+// 方案 B：只比较一次，存成 boolean 复用
+const dead = st === FlyState.Dead;
+if (dead) { /* … */ } else { /* … */ }
+env.setDeathDim(dead);            // ✅ 不再出现第二次比较
+```
+
+**判据**：同一个函数里要**多次**判断「是不是某个枚举值」时，不要用 `===` 反复比较字段，
+改用 **getter/方法** 或 **局部 boolean**。
+这是 ArkTS 与 TypeScript 的典型差异点：同类写法 TS 常常宽容放过，ArkTS 直接报错。
+
+> 补充：`switch (this.state)` 的 case 分支 `break`（不 return）不会造成收窄，
+> 只有「提前 return 的 if」才会。
+
+---
+
 ## 三、官方 HDS 组件（UIDesignKit）坑
 
 ### 14. `HdsNavDestination` 必须配套 `HdsNavigation` 使用 ⭐
