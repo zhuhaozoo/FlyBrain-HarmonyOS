@@ -141,3 +141,23 @@ v6 起新增的静态配景（花 / 蘑菇 / 灌木 / 倒木 / 芦苇等）几�
 |---|---|---|
 | `@ohos/hypium` | 单元测试框架（devDependency） | Apache License 2.0 |
 | `@ohos/hamock` | Mock 框架（devDependency） | Apache License 2.0 |
+
+---
+
+## 6. MaleCNS v1.0 连接组数据（v7 起随包分发，CC BY 4.0）
+
+- 来源：HHMI Janelia Research Campus（Fly EM Project）联合 MRC LMB、剑桥大学、Google Research
+  重建的**成年雄性果蝇完整中枢神经系统连接组** MaleCNS v1.0（2026-06 发布 v1.0）
+- 官方页面：https://male-cns.janelia.org/ · NeuPrint 数据集 `male-cns:v1.0`
+- 许可：**CC BY 4.0**（署名即可，允许商用）
+- 本项目使用其导出产物：165,122 个 Traced 神经元的坐标/分类/连接（聚合 2,556 万条边），
+  经 `tools/build_connectome_malecns.mjs` 转换为应用内 `connectome*.bin` 与脑点云
+- 论文：MaleCNS Consortium 的雄性果蝇全中枢连接组研究（Cell，2026，以正式发表信息为准）
+
+## 7. NeuroMechFly 果蝇重建模型（v7 起随包分发，Apache-2.0）
+
+- 来源：NeLy-EPFL「NeuroMechFly」v1.0 —— 真实黑腹果蝇 CT 重建的**分部件网格**
+  （65 个部件，33.4 万三角面：头/复眼/触角/口器/左右翅/平衡棒/五节跗节腿/腹节/胸）
+- 仓库：https://github.com/NeLy-EPFL/NeuroMechFly · 许可：**Apache License 2.0**
+- 本项目文件：`tools/assets/nmf_stl/`（STL + nmf*.sdf 拼装姿态），
+  由 `tools/gen_world_glb.mjs` 装配进 `world.glb` 的果蝇节点树
