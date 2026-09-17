@@ -1,10 +1,11 @@
 // M2：真实连接组 3D 大脑可视化页。
-// 数据：FlyWire FAFB v783 完整成年果蝇脑连接组的 139,255 个神经元坐标，
+// 数据：完整成年果蝇连接组神经元坐标（数据集随生成表切换：FAFB / MaleCNS，见升级迁移文档），
 //       按 super_class 分 5 组着色（视觉/感觉/中央/运动/内分泌），可独立显隐。
 // 交互：自动慢速自旋 + 单指拖拽旋转 + 双指缩放 + 分组开关。
 import { AnimatorOptions, AnimatorResult } from '@kit.ArkUI';
 import { Camera, Light, LightType, Node, Scene, SceneResourceFactory, Vec3 } from '@kit.ArkGraphics3D';
 import { hdsMaterial, HdsNavDestination } from '@kit.UIDesignKit';
+import { BRAIN_DATASET_LABEL, BRAIN_GROUPS, BrainGroupRow } from '../behavior/BrainGroups';
 import { clamp, lookAt, quatMul, quatX, quatY } from '../common/Math3D';
 
 class BrainGroup {
@@ -39,13 +40,18 @@ export struct BrainPage {
   @State private loading: boolean = true;
   @State private failed: boolean = false;
   @State private autoRotate: boolean = true;
-  @State private groups: BrainGroup[] = [
-    new BrainGroup('视觉', 'brain_optic', 77873),
-    new BrainGroup('感觉', 'brain_sensory', 16938),
-    new BrainGroup('中央', 'brain_central', 44254),
-    new BrainGroup('运动', 'brain_motor', 110),
-    new BrainGroup('内分泌', 'brain_endocrine', 80),
-  ];
+  // 分组表来自生成的 BrainGroups.ets（升级数据集后重跑 gen_brain_glb 即可换表）
+  @State private groups: BrainGroup[] = BRAIN_GROUPS.map((r: BrainGroupRow): BrainGroup =>
+    new BrainGroup(r.zh, r.node, r.count));
+
+  // 神经元总数（实际参与渲染的），顶栏/加载文案都用它——不写死数字
+  private totalNeurons(): number {
+    let sum = 0;
+    for (let i = 0; i < this.groups.length; i++) {
+      sum += this.groups[i].count;
+    }
+    return sum;
+  }
 
   aboutToAppear(): void {
     Scene.load($rawfile('gltf/brain.glb')).then(async (scene: Scene) => {
@@ -200,15 +206,15 @@ export struct BrainPage {
         } else {
           Column({ space: 12 }) {
             LoadingProgress().width(46).height(46).color('#FF7FA8D0')
-            Text('载入 139,255 个神经元…').fontSize(14).fontColor('#FFBBBBBB')
+            Text(`载入 ${this.totalNeurons()} 个神经元…`).fontSize(14).fontColor('#FFBBBBBB')
           }.justifyContent(FlexAlign.Center).width('100%').height('100%')
         }
 
         // 全屏覆盖层：顶部信息 / 底部图例（SpaceBetween 上下分布）
         Column() {
           Column({ space: 2 }) {
-            Text('完整成年果蝇脑连接组').fontSize(16).fontWeight(FontWeight.Bold).fontColor('#FFFFFFFF')
-            Text('139,255 个神经元 · FlyWire FAFB v783')
+            Text('完整成年果蝇连接组').fontSize(16).fontWeight(FontWeight.Bold).fontColor('#FFFFFFFF')
+            Text(`${BRAIN_DATASET_LABEL} · ${this.totalNeurons()} 神经元`)
               .fontSize(11).fontColor('#FF8899AA')
           }
           .alignItems(HorizontalAlign.Center)

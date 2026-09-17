@@ -28,6 +28,16 @@ build-logs/
 /tools/data/*.csv
 /tools/data/*.bin
 
+# MaleCNS 升级管线的中间数据与自测产物（见 docs/升级迁移-MaleCNS全中枢连接组.md）
+/tools/data_malecns*/
+# 全量连接组 307MB：超过 GitHub 单文件 100MB 硬限制，不入库（Lite 版 connectome.bin 48MB 入库；
+# 全量版用 docs/升级迁移 §8 的管线命令重新生成 --out-name connectome_full.bin）
+/entry/src/main/resources/rawfile/connectome_full.bin
+# 本机 AI 协作目录
+/.trae/
+/.zcode/
+/tools/_dbg.mjs
+
 # ===== 以下是本机自用文件，不纳入公开仓库 =====
 # AI 协作规则（本机开发流程约定）
 /AGENTS.md

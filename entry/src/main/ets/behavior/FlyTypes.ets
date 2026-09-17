@@ -25,9 +25,10 @@ export enum FlyDeathCause {
   Hunger,   // 饥饿耗尽
   Frog,     // 被青蛙捕获
   Water,    // 落水
+  Lost,     // 迷失野外（M5 软边界：在活动半径外停留过久，力竭）
 }
 
-export const FLY_DEATH_NAMES: string[] = ['', '饥饿耗尽', '被青蛙捕获', '落水'];
+export const FLY_DEATH_NAMES: string[] = ['', '饥饿耗尽', '被青蛙捕获', '落水', '迷失野外'];
 
 // 果蝇当前姿态：位置 + 朝向
 export class FlyPose {

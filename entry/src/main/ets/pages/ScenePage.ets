@@ -7,10 +7,14 @@ import { common } from '@kit.AbilityKit';
 import { AnimatorOptions, AnimatorResult } from '@kit.ArkUI';
 import { Node } from '@kit.ArkGraphics3D';
 import { ConnectomeDriver } from '../behavior/ConnectomeDriver';
+import { FlyAgents } from '../behavior/FlyAgents';
+import { FoodWorld } from '../behavior/FoodWorld';
 import { FlyBrain } from '../behavior/FlyBrain';
 import { flyConfig } from '../behavior/FlyConfig';
-import { FLY_DEATH_NAMES, FLY_STATE_NAMES, FlyState } from '../behavior/FlyTypes';
-import { groupLabel, groupRegion } from '../behavior/NeuronGroups';
+import { Obstacles } from '../behavior/Obstacles';
+import { WorldState } from '../behavior/WorldState';
+import { FLY_DEATH_NAMES, FLY_STATE_NAMES, FlyDeathCause, FlyState } from '../behavior/FlyTypes';
+import { groupLabel, groupRegion, datasetLabel } from '../behavior/NeuronGroups';
 import { EnvironmentController } from '../scene/EnvironmentController';
 import { FlyRenderer } from '../scene/FlyRenderer';
 import { FrogController } from '../scene/FrogController';
@@ -19,6 +23,21 @@ import { SceneManager } from '../scene/SceneManager';
 const TOOL_TOUCH = 0;
 const TOOL_FEED = 1;
 const TOOL_SPOT = 2;
+
+// 独立大脑上限（M5P1.1：每只果蝇一个 BrainWorker 实例 = 各自一份完整连接组仿真）。
+// 每个实例 ~31MB 内存 + 一个 10Hz 仿真线程，3 个已是中端机的合理上限；
+// 同屏果蝇数超过上限时，多出的个体退化为纯阈值驱动（无连接组调制）。
+const MAX_INDEPENDENT_BRAINS = 3;
+
+// 大脑小窗"活跃脑区明细"固定 8 行、全部显示（不足补占位）：小窗高度恒定，
+// 否则底部「查看 3D 大脑」按钮随放电数据上下跳动、点不中（用户实测反馈）
+const GROUP_DETAIL_LINES = 8;
+
+// 隐藏果蝇时把根节点移到的 y（远在地面圆盘与天空穹顶之外）。
+// 预置的 6 份果蝇模型都烘焙在原点，未上场的若只写 visible=false，真机上仍会被画出来
+// —— 叠在原点就表现为"地图中央多了一只不动的果蝇（像预置模型）"。
+// 位置一定会传递给子节点，所以"移出视野"比只改可见性可靠（与场内特效节点埋在 y=-10 同款约定）。
+const HIDDEN_FLY_Y: number = -80;
 
 // 控制面板玻璃卡片样式（半透明深底卡片）
 const GLASS_BG: string = '#6614141A';
@@ -35,24 +54,36 @@ export struct ScenePage {
   @StorageProp('fy_bottom_avoid') bottomAvoid: number = 24;
 
   private sceneMgr: SceneManager = new SceneManager();
-  private renderer: FlyRenderer = new FlyRenderer(flyConfig);
-  private brain: FlyBrain = new FlyBrain(flyConfig);
-  private driver: ConnectomeDriver = new ConnectomeDriver();
+  // M5 多智能体：共享食物世界与世界状态，FlyAgents 统一持有/驱动全部果蝇；
+  // 镜头跟随、行为按钮、投喂等交互默认作用于"主果蝇"（0 号）
+  // 静态障碍（石块/河岸卵石/树干）的碰撞圆：场景加载后由 blocker_i 标记节点填入，
+  // 必须先于 foods/agents 声明——它们的构造要用到同一个实例
+  private obstacles: Obstacles = new Obstacles();
+  private foods: FoodWorld = new FoodWorld(flyConfig, this.obstacles);
+  private world: WorldState = new WorldState(flyConfig);
+  private agents: FlyAgents = new FlyAgents(flyConfig, this.foods, this.world, this.obstacles);
+  private renderers: FlyRenderer[] = [];
+  // 独立大脑：drivers[i] 就是 i 号果蝇自己的连接组仿真（感觉刺激各自注入、运动群各自读取）
+  private drivers: ConnectomeDriver[] = [];
   private env: EnvironmentController = new EnvironmentController(flyConfig);
   private frog: FrogController = new FrogController(flyConfig);
   private sceneOpt: SceneOptions | null = null;
   private animator: AnimatorResult | null = null;
   private lastFrameMs: number = 0;
   private panLast: PanSample = new PanSample();
-  private pinchBaseRadius: number = 6.0;
+  private panTwoLast: PanSample = new PanSample();  // 双指平移的上一帧位置
+  private pinchBaseRadius: number = 8.0;   // v6：与 SceneManager 的默认 radius 同步（场地放大 1.5 倍）
   private lastState: FlyState = FlyState.Wander;
   private lastDriveTextMs: number = 0;
+  private appliedAgentCount: number = flyConfig.agentCount; // 已生效的上场数量（设置页改动轮询生效）
   private areaW: number = 0;
   private areaH: number = 0;
   private pinchFingers: boolean = false;  // 捏合手势进行中（避免滑杆与手势互相打架）
   private lightNames: string[] = ['亮', '暗', '黑'];
   // M4：特效计时（秒）
   private plusFxT: number = -1;           // "+"进食特效
+  private plusFxX: number = 0;            // 特效触发位置（哪只吃完就在哪只头顶）
+  private plusFxZ: number = 0;
   private lastCycles: number = 0;         // 已完成的昼夜轮数（成就判定）
   private deathsAtCycleStart: number = 0;
   private achiTimer: number = 0;          // 成就文案显示倒计时
@@ -69,25 +100,31 @@ export struct ScenePage {
   @State private activeCat: string = ''; // '' | behavior | interact | sim | view
   @State private brainPopup: boolean = false;
   // 视角控制（缩放滑杆 + 追踪开关 + 人称切换）
-  @State private zoomRadius: number = 5.6;
+  @State private zoomRadius: number = 8.0;   // v6：与 SceneManager.radius 初值同步
   @State private followMode: boolean = false;
   @State private followPerson: number = 0;  // 0 第一人称 / 1 第三人称
+  // 焦点果蝇（M5）：追踪镜头、状态行、行为按钮与投喂落点的共同目标，默认 0 号主果蝇；
+  // 在「视角」面板开启追踪后可循环切换（数量变化时帧循环会钳回 0 号）
+  @State private followIdx: number = 0;
   // 仿真运行统计：必须用 @State 独立变量承载，才能在帧循环里驱动 UI 刷新
-  // （直接读 this.driver.getDrive().xxx 不属于状态变量，值变化不会触发重建）
+  // （直接读 drivers[0].getDrive().xxx 不属于状态变量，值变化不会触发重建）
   @State private connSpikes: number = 0;
   @State private connActive: number = 0;
-  @State private connTotal: number = 61;
+  @State private connTotal: number = 0;
   @State private connTickMs: number = 0;
   @State private connReady: boolean = false;
   @State private uiBeat: number = 0;  // 心跳自增，保证每轮统计都会触发一次重建
+  // 数据集口径（来自运行时 ready 的真实数据，杜绝手写死数字）
+  @State private brainScale: string = '';
+  @State private datasetName: string = '';
   // M4：生命值 / 天敌预警 / 死亡文案
   @State private hpValue: number = 100;
   @State private crisis: boolean = false;
   @State private deathText: string = '';
   @State private achiText: string = '';
-  // 活跃脑区明细：按放电率排序的功能群名称 + 横条（数据来自 Worker 每 tick 上报的逐群放电）
-  @State private groupSummary: string = '';
-  @State private groupLines: string[] = [];
+  // 活跃脑区明细：固定 8 行（不足补占位"—"），保证大脑小窗高度恒定
+  @State private groupSummary: string = '—';
+  @State private groupLines: string[] = ['—', '—', '—', '—', '—', '—', '—', '—'];
 
   aboutToAppear(): void {
     try {
@@ -101,6 +138,14 @@ export struct ScenePage {
       // M4 功能开关（设置页可调，默认开）
       flyConfig.dayNightEnabled = store.getSync('dayNight', flyConfig.dayNightEnabled) as boolean;
       flyConfig.frogEnabled = store.getSync('frogEnabled', flyConfig.frogEnabled) as boolean;
+      // M5 同屏果蝇数量（1~6）
+      const savedCount = store.getSync('agentCount', flyConfig.agentCount) as number;
+      if (savedCount >= 1 && savedCount <= 6) {
+        flyConfig.agentCount = Math.round(savedCount);
+      }
+      // 连接组模式（Lite 瘦身 / 全仿真）持久化；默认 Lite
+      flyConfig.connFull = store.getSync('connFull', false) as boolean;
+
     } catch (err) {
       console.warn(`[FlyBrain] load speed prefs failed: ${JSON.stringify(err)}`);
     }
@@ -108,21 +153,35 @@ export struct ScenePage {
     this.sceneMgr.init().then((ok: boolean) => {
       this.loading = false;
       if (ok && this.sceneMgr.scene !== null) {
-        this.renderer.attach(this.sceneMgr.flyNode, this.sceneMgr.wingLeft, this.sceneMgr.wingRight,
-          this.sceneMgr.getNode('head_pivot'));
+        // 每份果蝇节点树配一个渲染器（未上场的由帧循环隐藏）
+        for (let i = 0; i < this.sceneMgr.flySets.length; i++) {
+          const set = this.sceneMgr.flySets[i];
+          const r = new FlyRenderer(flyConfig);
+          r.attach(set.fly, set.wingL, set.wingR, set.headPivot, set.legChains, set.mouthPivot);
+          this.renderers.push(r);
+        }
         // M4：环境控制器（昼夜/树摆/风线/涟漪）与青蛙控制器接管各自的节点
         this.env.attach(this.sceneMgr.light, this.sceneMgr.camera);
         this.env.setNodes(this.sceneMgr.extraNodes);
         this.frog.setNodes(this.sceneMgr.extraNodes);
-        // 把树上果实的位置（顶层节点，position 即世界坐标）交给行为层：
+        // 把树上果实的位置（顶层节点，position 即世界坐标）交给共享食物世界：
         // 果实成熟后自己落到地面，成为果蝇的自主食物来源
         for (let i = 0; i < this.sceneMgr.fruitNodes.length; i++) {
           const p = this.sceneMgr.fruitNodes[i].position;
-          this.brain.setFruitPosition(i, p.x, p.z, p.y);
+          this.foods.setFruitPosition(i, p.x, p.z, p.y);
         }
+        // 场内石块的碰撞圆：blocker_i 节点的 translation = 圆心、scale.x = 阻挡半径
+        // （生成脚本写入，运行时不做任何几何推算）——果蝇步行不可穿过石块
+        this.obstacles.clear();
+        for (let i = 0; i < this.sceneMgr.blockerNodes.length; i++) {
+          const bn = this.sceneMgr.blockerNodes[i];
+          const bp = bn.position;
+          this.obstacles.add(bp.x, bp.z, bn.scale.x);
+        }
+        console.info(`[FlyBrain] obstacles: ${this.obstacles.count()}`);
         this.applyLight(); // 把初始光照档位同步给环境控制器与行为层
         this.sceneOpt = { scene: this.sceneMgr.scene, modelType: ModelType.SURFACE } as SceneOptions;
-        this.loadFailed = !this.renderer.isAttached();
+        this.loadFailed = this.renderers.length === 0 || !this.renderers[0].isAttached();
         this.startLoop();
         // 仿真默认开启（M3）
         this.toggleConnectome();
@@ -137,7 +196,10 @@ export struct ScenePage {
       (this.animator as AnimatorResult).finish();
       this.animator = null;
     }
-    this.driver.stop();
+    for (const d of this.drivers) {
+      d.stop();
+    }
+    this.drivers = [];
   }
 
   private animateToggle(fn: () => void): void {
@@ -162,25 +224,80 @@ export struct ScenePage {
       const dt = Math.min((now - this.lastFrameMs) / 1000, 0.05);
       this.lastFrameMs = now;
 
-      // M4：先把天敌状态喂给行为层（蓄力提示 + 命中伤害），再推进行为，保证同帧生效。
-      // 蓄力窗口只有 0.8s，这里按"变化才写 @State"刷新预警，避免每帧重建又多给即时反馈。
+      // 设置页改了数量 → 在帧循环里轮询生效（ScenePage 常驻，aboutToAppear 不会重跑）
+      if (flyConfig.agentCount !== this.appliedAgentCount) {
+        this.appliedAgentCount = flyConfig.agentCount;
+        this.agents.setActiveCount(this.appliedAgentCount);
+        this.syncDriverCount(); // 异步：独立大脑数量跟着上场数量对齐
+      }
+      const lead = this.agents.getLead();
+      const n = this.agents.getActiveCount();
+      // 上场数量变小时把焦点钳回 0 号；镜头追踪与行为按钮都作用于焦点果蝇
+      if (this.followIdx >= n) {
+        this.followIdx = 0;
+      }
+      const focus = this.getFocus();
+
+      // M4：青蛙索敌最近的活果蝇（多目标；青蛙会跳，用它的实时位置）。
+      // 蓄力提示只标给被盯上的那只；"变化才写 @State"刷新预警。
+      let tIdx = -1;
+      let tDist = 1e9;
+      for (let i = 0; i < n; i++) {
+        const b = this.agents.getBrain(i);
+        if (b.isDead()) {
+          continue;
+        }
+        const p = b.getPose();
+        const d = Math.hypot(p.x - this.frog.getPosX(), p.z - this.frog.getPosZ());
+        if (d < tDist) {
+          tDist = d;
+          tIdx = i;
+        }
+      }
       const charging = this.frog.isCharging();
-      this.brain.setFrogThreat(charging);
+      for (let i = 0; i < n; i++) {
+        this.agents.getBrain(i).setFrogThreat(charging && i === tIdx);
+      }
       if (charging !== this.crisis) {
         this.crisis = charging;
       }
-      this.frog.update(dt, this.brain.getPose().x, this.brain.getPose().z, !this.brain.isDead());
-      if (this.frog.consumeHit()) {
-        this.brain.hitByFrog();
+      if (tIdx >= 0) {
+        const tp = this.agents.getBrain(tIdx).getPose();
+        this.frog.update(dt, tp.x, tp.z, tp.y, true);
+        if (this.frog.consumeHit()) {
+          // 命中：拖到青蛙嘴边 → 咬死（嘴边消失，5 秒后原点重生）或挣脱起飞（见 hitByFrog）
+          this.agents.getBrain(tIdx).hitByFrog(this.frog.getPosX(), this.frog.getPosZ());
+        }
+      } else {
+        this.frog.update(dt, flyConfig.frogX, flyConfig.frogZ, 0, false);
+        this.frog.consumeHit();
       }
 
-      this.brain.update(dt);
-      const pose = this.brain.getPose();
-      const st = this.brain.getState();
-      // 环境（昼夜/树摆/风线/涟漪）每帧驱动；风力来自行为层
-      this.env.update(dt, this.brain.getWindStrength());
-      this.renderer.apply(pose, st, this.brain.getTotalTime(), this.isExcited(st));
+      // 全部果蝇推进（共享世界 → 逐个体 → 个体互斥）
+      this.agents.update(dt);
+
+      // 环境（昼夜/树摆/风线/涟漪）每帧驱动；风力来自共享世界状态
+      this.env.update(dt, this.world.getWindStrength());
+      // 逐个体写姿态；未上场的隐藏；被青蛙捕获的（死亡原因 Frog）尸体也隐藏——"被叼走"
+      for (let i = 0; i < this.renderers.length; i++) {
+        const set = this.sceneMgr.flySets[i];
+        if (i < n && set.fly !== null) {
+          const b = this.agents.getBrain(i);
+          const bst = b.getState();
+          const captured = bst === FlyState.Dead && b.getLastDeathCause() === FlyDeathCause.Frog;
+          if (captured) {
+            this.hideFlyNode(set.fly as Node);
+          } else {
+            (set.fly as Node).visible = true;
+            this.renderers[i].apply(b.getPose(), bst, b.getTotalTime(), this.isExcited(b, bst));
+          }
+        } else if (set.fly !== null) {
+          this.hideFlyNode(set.fly as Node);
+        }
+      }
       this.syncPropNodes(dt);
+      // 相机跟随焦点果蝇（视角面板可切换追踪哪一只）
+      const pose = focus.getPose();
       this.sceneMgr.setFlyPose(pose.x, pose.y, pose.z, pose.yaw);
       this.sceneMgr.followFly(pose.x, pose.z);
       // 缩放滑杆跟随手势变化（追踪模式下同步）
@@ -190,40 +307,56 @@ export struct ScenePage {
           this.zoomRadius = r;
         }
       }
+      const st = focus.getState();
       if (st !== this.lastState) {
         this.lastState = st;
         this.stateLabel = FLY_STATE_NAMES[st];
       }
       if (now - this.lastDriveTextMs > 300) {
         this.lastDriveTextMs = now;
-        // M4：生命值 / 死亡倒计时同步到 @State（crisis 已在帧循环里即时更新）
-        this.hpValue = Math.round(this.brain.getHp());
+        // M4：生命值 / 死亡倒计时同步到 @State（crisis 已在帧循环里即时更新）。
+        // HP 徽章显示最危急的一只（存活中 HP 最低），死亡提示对任何一只都生效。
+        let worst = lead;
+        let deadFly: FlyBrain | null = null;
+        for (let i = 0; i < n; i++) {
+          const b = this.agents.getBrain(i);
+          if (b.isDead() && deadFly === null) {
+            deadFly = b;
+          }
+          if (!b.isDead() && b.getHp() < worst.getHp()) {
+            worst = b;
+          }
+        }
+        // HP 徽章：锁定视角时显示焦点果蝇本人的 HP（个体状态），否则显示最危急的一只
+        this.hpValue = this.followMode
+          ? Math.round(this.getFocus().getHp())
+          : Math.round(worst.getHp());
         // 只比较一次并存成 boolean：避免 ArkTS 对同一联合类型做多次比较时的收窄报错（易错总结第 28 条）
-        const dead = st === FlyState.Dead;
-        if (dead) {
-          const cause = FLY_DEATH_NAMES[this.brain.getLastDeathCause()];
-          this.deathText = `💀 ${cause} · ${this.brain.getRespawnCountdown().toFixed(1)}s 后重生`;
-          // 写入 AppStorage，供「关于」页展示"这只果蝇的一生"
-          AppStorage.setOrCreate('fy_deaths', this.brain.getDeathCount());
+        const anyDead: boolean = deadFly !== null;
+        if (anyDead && deadFly !== null) {
+          const cause = FLY_DEATH_NAMES[deadFly.getLastDeathCause()];
+          this.deathText = `💀 ${cause} · ${deadFly.getRespawnCountdown().toFixed(1)}s 后重生`;
+          // 写入 AppStorage，供「关于」页展示果蝇种群的死亡统计（全体累计）
+          AppStorage.setOrCreate('fy_deaths', this.agents.totalDeaths());
           AppStorage.setOrCreate('fy_last_death', cause);
         } else {
           this.deathText = '';
         }
         // 死亡期间整体压暗 10%
-        this.env.setDeathDim(dead);
+        this.env.setDeathDim(anyDead);
         // 轻量成就：连续喂养 3 次 / 完整一轮昼夜零死亡
-        if (this.brain.consumeTrustUp()) {
+        if (lead.consumeTrustUp()) {
           this.achiText = '🤝 信任+1';
           this.achiTimer = 3;
         }
         const cy = this.env.getCycles();
         if (cy !== this.lastCycles) {
-          if (this.brain.getDeathCount() === this.deathsAtCycleStart) {
+          if (lead.getDeathCount() === this.deathsAtCycleStart) {
             this.achiText = '🌙 平安一夜';
             this.achiTimer = 4;
           }
           this.lastCycles = cy;
-          this.deathsAtCycleStart = this.brain.getDeathCount();
+          this.deathsAtCycleStart = lead.getDeathCount();
         }
         if (this.achiTimer > 0) {
           this.achiTimer -= 0.3;
@@ -231,44 +364,100 @@ export struct ScenePage {
             this.achiText = '';
           }
         }
-        let text = `饿${Math.round(this.brain.getHunger() * 100)}% ` +
-          `怕${Math.round(this.brain.getFear() * 100)}% ` +
-          `累${Math.round(this.brain.getFatigue() * 100)}%`;
-        if (this.connState === 2 && this.driver.isReady()) {
-          const d = this.driver.getDrive();
-          this.brain.setConnectomeDrive(d.walk, d.feed, d.groom, d.startle);
-          let foodNear = false;
-          const foods = this.brain.getFoods();
-          for (let i = 0; i < foods.length; i++) {
-            const f = foods[i];
-            if (f.active && Math.hypot(f.x - pose.x, f.z - pose.z) < 2.5) {
-              foodNear = true;
-              break;
-            }
+        // 状态行文字：锁定视角时显示焦点果蝇的**个体**内驱力（不显示平均值），
+        // 未锁定时保持群体摘要（数量 + 均值）
+        let text: string;
+        if (this.followMode) {
+          text = `🎯第${this.followIdx + 1}只 饿${Math.round(focus.getHunger() * 100)}%` +
+            ` 累${Math.round(focus.getFatigue() * 100)}%`;
+        } else {
+          let hungerSum = 0;
+          let fatigueSum = 0;
+          for (let i = 0; i < n; i++) {
+            hungerSum += this.agents.getBrain(i).getHunger();
+            fatigueSum += this.agents.getBrain(i).getFatigue();
           }
-          this.driver.setEnvironment(foodNear, this.brain.getLightLevel(),
-            this.brain.getHunger(), this.brain.getFatigue());
-          text += ` ⚡${Math.round(d.spikesPerSec)}/s`;
-          // 同步仿真统计到 @State（驱动面板/小窗实时刷新）
-          this.connSpikes = Math.round(d.spikesPerSec);
-          this.connActive = d.activeGroups;
-          this.connTotal = d.totalGroups;
-          this.connTickMs = Math.round(d.avgTickMs);
-          this.connReady = d.ready;
-          // 活跃脑区明细：取本窗口内各群放电率（读取即重置累积，故只在这里调用一次）
-          this.refreshGroupDetail(this.driver.takeGroupRates());
+          text = `👥${n}只 饿均${Math.round(hungerSum / n * 100)}% 累均${Math.round(fatigueSum / n * 100)}%`;
         }
-        this.uiBeat++;
-        this.driveText = text;
+        if (this.connState === 2 && this.drivers.length > 0 && this.drivers[0].isReady()) {
+          // 独立大脑（M5P1.1）：每只果蝇有自己的 BrainWorker——感觉刺激按各自处境注入，
+          // 运动群放电各自读取；超出上限的个体无连接组调制（纯阈值驱动）
+          let spikeSum = 0;
+          let readyCount = 0;
+          for (let i = 0; i < n; i++) {
+            const b = this.agents.getBrain(i);
+            const drv = i < this.drivers.length ? this.drivers[i] : null;
+            if (drv === null || !drv.isReady()) {
+              b.setConnectomeDrive(0, 0, 0, 0, 0, 0);
+              continue;
+            }
+            readyCount++;
+            let foodNear = false;
+            const bp = b.getPose();
+            const foodsArr = this.foods.getFoods();
+            for (let k = 0; k < foodsArr.length; k++) {
+              const f = foodsArr[k];
+              if (f.active && Math.hypot(f.x - bp.x, f.z - bp.z) < 2.5) {
+                foodNear = true;
+                break;
+              }
+            }
+            drv.setEnvironment(foodNear, this.world.getLightLevel(),
+              b.getHunger(), b.getFatigue());
+            const d = drv.getDrive();
+            b.setConnectomeDrive(d.walk, d.feed, d.groom, d.startle, d.turn, d.wing);
+            spikeSum += d.spikesPerSec;
+          }
+          // ⚡ 同样分两种口径：锁定视角时显示焦点果蝇自己大脑的放电率
+          //（超出独立大脑上限的个体无连接组，不显示）；未锁定时为全体合计
+          if (this.followMode) {
+            const fd = this.followIdx < this.drivers.length ? this.drivers[this.followIdx] : null;
+            if (fd !== null && fd.isReady()) {
+              text += ` ⚡${Math.round(fd.getDrive().spikesPerSec)}/s`;
+            }
+          } else {
+            text += ` ⚡${Math.round(spikeSum)}/s`;
+          }
+          // 同步仿真统计到 @State（驱动面板/小窗实时刷新；明细取 0 号大脑）
+          this.connSpikes = Math.round(spikeSum);
+          const d0 = this.drivers[0].getDrive();
+          this.connActive = d0.activeGroups;
+          this.connTotal = d0.totalGroups;
+          this.connTickMs = Math.round(d0.avgTickMs);
+          this.connReady = readyCount > 0;
+          // 数据集口径：全部来自运行时真实数据（升级迁移文档 §5.4——消灭手写死数字）
+          this.datasetName = d0.dataset;
+          this.brainScale = `${(d0.neurons / 10000).toFixed(1)}万神经元 · ` +
+            `${(d0.edges / 10000).toFixed(0)}万连接`;
+          AppStorage.setOrCreate('fy_brain_label',
+            `${d0.dataset} · ${(d0.neurons / 10000).toFixed(1)}万神经元`);
+          // 活跃脑区明细：取本窗口内各群放电率（读取即重置累积，故只在这里调用一次）
+          this.refreshGroupDetail(this.drivers[0].takeGroupRates());
+        }
+          this.uiBeat++;
+          this.driveText = text;
       }
     };
     (this.animator as AnimatorResult).play();
   }
 
-  // M4：趋光兴奋态（Wander + 光斑生效 + 够亮）
-  private isExcited(st: FlyState): boolean {
-    return st === FlyState.Wander && this.brain.isSpotActive() &&
-      this.brain.getLightLevel() > flyConfig.phototaxisLight;
+  // 隐藏一份果蝇（未上场 / 被青蛙叼走）：可见性 + 移出视野双保险。
+  // 只写 visible=false 时，真机上这份"没被驱动的预置模型"仍会显示在原点——
+  // 多份叠在一起看着就像"地图中央多了一只完全静止的果蝇"。
+  private hideFlyNode(node: Node): void {
+    node.visible = false;
+    node.position = { x: 0, y: HIDDEN_FLY_Y, z: 0 };
+  }
+
+  // M4：趋光兴奋态（Wander + 光斑生效 + 够亮）——按个体判断；
+  // 连接组"振翅意图"通道（翅运动群放电，MaleCNS 后有真实读数）也能触发
+  private isExcited(b: FlyBrain, st: FlyState): boolean {
+    if (st === FlyState.Wander && b.isSpotActive() &&
+      b.getLightLevel() > flyConfig.phototaxisLight) {
+      return true;
+    }
+    return st === FlyState.Wander && b.isConnectomeMode() &&
+      b.getConnWing() >= flyConfig.connWingG;
   }
 
   // 光照档位：用户倍率交给渲染层，行为层用的 lightLevel 在夜间被压到 0
@@ -277,18 +466,17 @@ export struct ScenePage {
     const level = this.lightIdx === 0 ? 1 : (this.lightIdx === 1 ? 0.5 : 0);
     this.sceneMgr.setLightLevel(level);
     this.env.setUserLightFactor(this.sceneMgr.getUserLightFactor());
-    this.brain.setLightLevel(this.env.isNight() ? 0 : level);
+    this.world.setLightLevel(this.env.isNight() ? 0 : level);
   }
 
   // M4.2：把「各群放电率」整理成可读明细。
   // 逐群放电数由 Worker 每 tick 上报，驱动侧累积后换算成"次/秒"再交到这里；
   // 名称表见 behavior/NeuronGroups.ets（数据源 neuron_meta.json）。
+  // 注意：输出行数固定为 GROUP_DETAIL_LINES（不足补占位"—"）——
+  // 大脑小窗高度必须恒定，否则底部的「查看 3D 大脑」按钮会随数据跳动点不中（用户实测反馈）。
   private refreshGroupDetail(rates: number[]): void {
-    if (rates.length === 0) {
-      return;
-    }
-    const idx: number[] = [];
     let maxRate = 0.5;
+    const idx: number[] = [];
     for (let i = 0; i < rates.length; i++) {
       if (rates[i] > 0.5) {
         idx.push(i);
@@ -307,7 +495,7 @@ export struct ScenePage {
       }
       idx[j + 1] = v;
     }
-    // 脑区维度汇总：感觉 / 中央 / 驱动 / 运动 各有多少群在活跃
+    // 脑区维度汇总：感觉 / 中央 / 驱动 / 运动 各有多少群在活跃（无数据时也占位）
     let nSense = 0;
     let nCentral = 0;
     let nDrive = 0;
@@ -324,32 +512,34 @@ export struct ScenePage {
         nMotor++;
       }
     }
-    this.groupSummary = `感觉${nSense} 中央${nCentral} 驱动${nDrive} 运动${nMotor}`;
+    this.groupSummary = idx.length > 0
+      ? `感觉${nSense} 中央${nCentral} 驱动${nDrive} 运动${nMotor}`
+      : '—';
 
-    const top = 8;
     const lines: string[] = [];
-    const n = Math.min(top, idx.length);
-    for (let i = 0; i < n; i++) {
-      const gid = idx[i];
-      const ratio = rates[gid] / maxRate;
-      const bars = Math.max(1, Math.round(ratio * 6));
-      let bar = '';
-      for (let b = 0; b < bars; b++) {
-        bar += '█';
+    for (let i = 0; i < GROUP_DETAIL_LINES; i++) {
+      if (i < idx.length) {
+        const gid = idx[i];
+        const ratio = rates[gid] / maxRate;
+        const bars = Math.max(1, Math.round(ratio * 6));
+        let bar = '';
+        for (let b = 0; b < bars; b++) {
+          bar += '█';
+        }
+        lines.push(`${groupLabel(gid)} ${bar} ${rates[gid].toFixed(0)}/s`);
+      } else {
+        lines.push('—');
       }
-      lines.push(`${groupLabel(gid)} ${bar} ${rates[gid].toFixed(0)}/s`);
-    }
-    if (idx.length > top) {
-      lines.push(`…另有 ${idx.length - top} 个脑区在放电`);
     }
     this.groupLines = lines;
   }
 
   private syncPropNodes(dt: number): void {
-    const total = this.brain.getTotalTime();
-    const pose = this.brain.getPose();
-    const foods = this.brain.getFoods();
-    const userCount = this.brain.getUserFoodCount();
+    // 觅食路径点跟随焦点果蝇（与追踪镜头一致：看哪只就画哪只的觅食路线）
+    const total = this.getFocus().getTotalTime();
+    const pose = this.getFocus().getPose();
+    const foods = this.foods.getFoods();
+    const userCount = this.foods.getUserFoodCount();
 
     // 用户投喂：弹跳落地
     for (let i = 0; i < this.sceneMgr.foodNodes.length && i < userCount; i++) {
@@ -388,28 +578,29 @@ export struct ScenePage {
       }
     }
 
-    // 光斑：呼吸缩放 0.94~1.06（0.8Hz）
+    // 光斑：呼吸缩放 0.94~1.06（0.8Hz）——世界唯一，位置来自共享世界状态
     const spot = this.sceneMgr.spotNode;
     if (spot) {
-      if (this.brain.isSpotActive()) {
+      if (this.world.isSpotActive()) {
         const breathe = 1.0 + 0.06 * Math.sin(total * 0.8 * Math.PI * 2);
         (spot as Node).visible = true;
-        (spot as Node).position = { x: this.brain.getSpotX(), y: 0.02, z: this.brain.getSpotZ() };
+        (spot as Node).position = { x: this.world.getSpotX(), y: 0.02, z: this.world.getSpotZ() };
         (spot as Node).scale = { x: breathe, y: 1, z: breathe };
       } else {
         (spot as Node).visible = false;
       }
     }
 
-    // 觅食虚线路径：Seek 时在果蝇与食物之间铺 6 个流动的路径点
+    // 觅食虚线路径：主果蝇 Seek 时在其与食物之间铺 6 个流动的路径点
     this.syncPathDots(total, pose.x, pose.z);
 
-    // 进食完成「＋」特效
-    this.syncPlusFx(dt, pose.x, pose.z);
+    // 进食完成「＋」特效（任意一只吃完都触发）
+    this.syncPlusFx(dt);
   }
 
   private syncPathDots(total: number, flyX: number, flyZ: number): void {
-    const show = this.brain.getState() === FlyState.Seek;
+    // 与传入的 flyX/flyZ 同源：只画焦点果蝇的觅食路线
+    const show = this.getFocus().getState() === FlyState.Seek;
     if (!show) {
       for (let i = 0; i < 6; i++) {
         const n = this.sceneMgr.getNode(`path_dot_${i}`);
@@ -420,7 +611,7 @@ export struct ScenePage {
       return;
     }
     // 最近的食物作为路径终点
-    const foods = this.brain.getFoods();
+    const foods = this.foods.getFoods();
     let tx = 0;
     let tz = 0;
     let best = 1e9;
@@ -456,9 +647,15 @@ export struct ScenePage {
     }
   }
 
-  private syncPlusFx(dt: number, flyX: number, flyZ: number): void {
-    if (this.brain.consumeFeedDone()) {
-      this.plusFxT = 0;
+  private syncPlusFx(dt: number): void {
+    // 任意一只吃完都触发"+"特效（特效位置在那只果蝇头顶）
+    for (let i = 0; i < this.agents.getActiveCount(); i++) {
+      if (this.agents.getBrain(i).consumeFeedDone()) {
+        this.plusFxT = 0;
+        const p = this.agents.getBrain(i).getPose();
+        this.plusFxX = p.x;
+        this.plusFxZ = p.z;
+      }
     }
     if (this.plusFxT < 0) {
       return;
@@ -483,9 +680,9 @@ export struct ScenePage {
       const ang = i * 2.094; // 三个方向散开
       n.visible = true;
       n.position = {
-        x: flyX + 0.18 * Math.cos(ang),
+        x: this.plusFxX + 0.18 * Math.cos(ang),
         y: 0.10 + 0.55 * p + i * 0.05,
-        z: flyZ + 0.18 * Math.sin(ang),
+        z: this.plusFxZ + 0.18 * Math.sin(ang),
       };
       const s = 1.0 - 0.45 * p;
       n.scale = { x: s, y: s, z: s };
@@ -512,34 +709,98 @@ export struct ScenePage {
       return;
     }
     if (this.tool === TOOL_FEED) {
-      this.brain.placeFood(p.x, p.z);
+      this.foods.placeFood(p.x, p.z);
     } else if (this.tool === TOOL_SPOT) {
-      this.brain.setLightSpot(p.x, p.z, true);
+      this.world.setLightSpot(p.x, p.z, true);
       if (this.lightIdx !== 0) {
         this.lightIdx = 0;
         this.applyLight();
       }
     } else {
-      const hit = this.brain.touch(p.x, p.z);
-      if (hit && this.connState === 2 && this.driver.isReady()) {
-        this.driver.joltTouch();
+      // 触碰：点到哪只算哪只，惊吓刺激只注入被碰到那只的独立大脑
+      let hitIdx = -1;
+      for (let i = 0; i < this.agents.getActiveCount() && hitIdx < 0; i++) {
+        if (this.agents.getBrain(i).touch(p.x, p.z)) {
+          hitIdx = i;
+        }
+      }
+      if (hitIdx >= 0 && hitIdx < this.drivers.length && this.drivers[hitIdx].isReady()) {
+        this.drivers[hitIdx].joltTouch();
       }
     }
   }
 
-  // 点击「投喂」立即在果蝇前方落一份食物（仍可点地面精确指定位置）
+  // 点击「投喂」立即在焦点果蝇前方落一份食物（仍可点地面精确指定位置）
   private feedInFront(): void {
-    const pose = this.brain.getPose();
+    const pose = this.getFocus().getPose();
     const d = 0.9;
-    this.brain.placeFood(pose.x + Math.sin(pose.yaw) * d, pose.z + Math.cos(pose.yaw) * d);
+    this.foods.placeFood(pose.x + Math.sin(pose.yaw) * d, pose.z + Math.cos(pose.yaw) * d);
+  }
+
+  // 焦点果蝇：视角追踪、状态行、行为按钮与投喂落点的共同目标（默认 0 号主果蝇）。
+  // 越界时钳回 0 号，保证任何时刻都返回有效个体。
+  private getFocus(): FlyBrain {
+    const n = this.agents.getActiveCount();
+    return this.agents.getBrain(this.followIdx < n ? this.followIdx : 0);
   }
 
   private cycleLight(): void {
     this.lightIdx = (this.lightIdx + 1) % 3;
     if (this.lightIdx !== 0) {
-      this.brain.setLightSpot(0, 0, false);
+      this.world.setLightSpot(0, 0, false);
     }
     this.applyLight();
+  }
+
+  // 独立大脑数量与上场果蝇数对齐（上限 MAX_INDEPENDENT_BRAINS）。
+  // 每个实例要加载 31MB 连接组并起一个仿真线程，串行启动避免内存峰值叠加。
+  // 注意并发：toggleConnectome 与帧循环的数量轮询可能同时调用（真机实测曾因此
+  // 起出 4 个 worker）——用 busy/pending 保证同一时刻只有一个循环在推进，
+  // 且循环内每轮重算 want，把"执行期间又变的数量"也收敛掉。
+  private syncBusy: boolean = false;
+  private syncPending: boolean = false;
+
+  private async syncDriverCount(): Promise<void> {
+    if (this.connState === 0) {
+      return; // 连接组已关闭：保持空
+    }
+    if (this.syncBusy) {
+      this.syncPending = true; // 正在同步：让在跑的循环顺带收敛到最新数量
+      return;
+    }
+    this.syncBusy = true;
+    try {
+      do {
+        this.syncPending = false;
+        const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
+        for (;;) {
+          const want = Math.min(this.agents.getActiveCount(), MAX_INDEPENDENT_BRAINS);
+          if (this.drivers.length === want) {
+            break;
+          }
+          if (this.drivers.length > want) {
+            const d = this.drivers.pop();
+            if (d) {
+              d.stop();
+            }
+            continue;
+          }
+          const d = new ConnectomeDriver();
+          const ok = await d.start(context, flyConfig.connFull);
+          if (!ok) {
+            return;
+          }
+          this.drivers.push(d);
+          // v7.1：等上一个驱动器的连接组真正就绪再加载下一个 —— 完整连接组 2500 万边
+          // 的 CSR 峰值内存不小，串行就绪避免三个 Worker 的加载峰值叠加触发系统杀进程；
+          // 期间读取已在 Worker 线程，主线程只剩事件循环心跳
+          await d.waitReady(120000);
+          await new Promise<void>((resolve) => setTimeout(resolve, 80));
+        }
+      } while (this.syncPending);
+    } finally {
+      this.syncBusy = false;
+    }
   }
 
   private async toggleConnectome(): Promise<void> {
@@ -547,27 +808,33 @@ export struct ScenePage {
       return;
     }
     if (this.connState === 2) {
-      this.driver.stop();
+      for (const d of this.drivers) {
+        d.stop();
+      }
+      this.drivers = [];
       this.connState = 0;
-      this.brain.setConnectomeMode(false);
+      for (let i = 0; i < this.agents.getActiveCount(); i++) {
+        this.agents.getBrain(i).setConnectomeMode(false);
+      }
       return;
     }
     this.connState = 1;
     try {
-      const context = this.getUIContext().getHostContext() as common.UIAbilityContext;
-      const ok = await this.driver.start(context);
-      this.connState = ok && this.driver.isRunning() ? 2 : 0;
-      this.brain.setConnectomeMode(this.connState === 2);
+      await this.syncDriverCount();
+      this.connState = this.drivers.length > 0 && this.drivers[0].isRunning() ? 2 : 0;
     } catch (err) {
       console.error(`[FlyBrain] connectome toggle failed: ${JSON.stringify(err)}`);
       this.connState = 0;
+    }
+    for (let i = 0; i < this.agents.getActiveCount(); i++) {
+      this.agents.getBrain(i).setConnectomeMode(this.connState === 2);
     }
   }
 
   private toggleCat(cat: string): void {
     this.animateToggle((): void => {
       this.activeCat = this.activeCat === cat ? '' : cat;
-      this.brainPopup = false;
+      // 大脑状态小窗保持打开（用户要求：切控制面板不关闭小窗）
     });
   }
 
@@ -605,7 +872,7 @@ export struct ScenePage {
         .fontSize(12).height(28).backgroundColor(CHIP_BG)
         .onClick(() => {
           this.paused = !this.paused;
-          this.brain.setPaused(this.paused);
+          this.agents.setPaused(this.paused);
         })
     }
     .width('100%')
@@ -710,13 +977,13 @@ export struct ScenePage {
 
         Row({ space: 6 }) {
           Button('漫步').fontSize(13).height(34).layoutWeight(1).backgroundColor(CHIP_BG)
-            .onClick(() => this.brain.wanderNow())
+            .onClick(() => this.getFocus().wanderNow())
           Button('理毛').fontSize(13).height(34).layoutWeight(1).backgroundColor(CHIP_BG)
-            .onClick(() => this.brain.groomNow())
+            .onClick(() => this.getFocus().groomNow())
           Button('起飞').fontSize(13).height(34).layoutWeight(1).backgroundColor(CHIP_BG)
-            .onClick(() => this.brain.takeoff())
+            .onClick(() => this.getFocus().takeoff())
           Button('降落').fontSize(13).height(34).layoutWeight(1).backgroundColor(CHIP_BG)
-            .onClick(() => this.brain.land())
+            .onClick(() => this.getFocus().land())
         }.width('100%')
       }
     }
@@ -758,9 +1025,10 @@ export struct ScenePage {
           Text('环境').fontSize(13).fontColor('#FFC6D2DC').width(44)
           Button('吹风').fontSize(12).height(32).layoutWeight(1).backgroundColor(CHIP_BG)
             .onClick(() => {
-              this.brain.gust();
-              if (this.connState === 2 && this.driver.isReady()) {
-                this.driver.joltWind();
+              this.world.gust();
+              // 风是世界级的：所有独立大脑的约翰斯顿器感受群都收到一次强刺激
+              for (const d of this.drivers) {
+                d.joltWind();
               }
             })
           Button(`光照·${this.lightNames[this.lightIdx]}`).fontSize(12).height(32).layoutWeight(2)
@@ -845,6 +1113,20 @@ export struct ScenePage {
           Text(this.followPerson === 0 ? '第一人称：从果蝇视角看世界' :
             '第三人称：从后上方跟随果蝇（缩放滑杆调距离）')
             .fontSize(10).fontColor('#FF8FA3B0').width('100%')
+
+          // M5：多果蝇——追踪目标可切换。镜头、状态行、行为按钮与投喂落点跟的是同一只；
+          // 点击按上场数量循环（数量在点击时现读，设置页改完回来立即正确）
+          Button(`切换追踪目标 · 当前第 ${this.followIdx + 1} 只`)
+            .fontSize(13).height(36).width('100%')
+            .backgroundColor(CHIP_BG)
+            .onClick(() => {
+              const cnt = this.agents.getActiveCount();
+              if (cnt > 1) {
+                this.followIdx = (this.followIdx + 1) % cnt;
+              }
+            })
+          Text('行为按钮与投喂落点也作用于这只果蝇')
+            .fontSize(10).fontColor('#FF6B7A86').width('100%')
         }
 
         Row({ space: 6 }) {
@@ -852,8 +1134,9 @@ export struct ScenePage {
             .onClick(() => {
               this.followMode = false;
               this.sceneMgr.setFollowMode(false);
-              this.zoomRadius = 5.6;
-              this.sceneMgr.setRadius(5.6);
+              this.zoomRadius = 8.0;
+              this.sceneMgr.setRadius(8.0);
+              this.sceneMgr.resetTarget();   // 平移过的注视点也回到场心
             })
           Button('最远').fontSize(12).height(30).layoutWeight(1).backgroundColor(CHIP_BG)
             .onClick(() => {
@@ -867,7 +1150,7 @@ export struct ScenePage {
             })
         }.width('100%')
 
-        Text('单指拖动转视角 · 双指捏合缩放 · 滑杆精确缩放')
+        Text('单指拖动转视角 · 双指拖动平移 · 双指捏合缩放 · 滑杆精确缩放')
           .fontSize(10).fontColor('#FF6B7A86').width('100%')
       }
     }
@@ -905,7 +1188,7 @@ export struct ScenePage {
         if (this.connState === 2 && this.connReady) {
           this.SimStats()
         } else {
-          Text('开启后：13.9 万神经元的真实连接组在手机上实时仿真，行为部分由放电驱动')
+          Text(`开启后：${datasetLabel()}的真实连接组在手机上实时仿真，行为受放电调制`)
             .fontSize(10).fontColor('#FF6B7A86').width('100%')
         }
       }
@@ -924,6 +1207,17 @@ export struct ScenePage {
       Blank()
       Text(value).fontSize(12).fontColor('#FFE6ECF2')
     }.width('100%')
+  }
+
+  // 大脑小窗「活跃脑区明细」的一行（下标固定 0..GROUP_DETAIL_LINES-1，行高固定 16）。
+  // 关键：值必须在 @Builder 内**直接读 @State**（this.groupLines）——
+  // 一旦改成"把字符串当参数传进来"，参数就是值快照，数值会冻结（易错总结第 8 条）。
+  @Builder
+  GroupLine(i: number) {
+    Text(this.groupLines[i] === '' ? '—' : this.groupLines[i])
+      .fontSize(10.5)
+      .fontColor(this.groupLines[i] === '' || this.groupLines[i] === '—' ? '#FF4A5560' : '#FFCBD8E2')
+      .width('100%').maxLines(1).height(16)
   }
 
   // 仿真统计（实时区）：必须在 @Builder 内**直接引用 @State 变量**，
@@ -991,19 +1285,24 @@ export struct ScenePage {
           Blank()
           Text(`${this.connActive} / ${this.connTotal}`).fontSize(12).fontColor('#FFE6ECF2')
         }.width('100%')
-        // 逐群明细：直接引用 @State（@Builder 参数是值快照，不能靠传参刷新）
-        if (this.groupSummary !== '') {
-          Text(this.groupSummary).fontSize(10.5).fontColor('#FF8FA3B0').width('100%')
+        // 脑区明细：固定行数 + 固定行高，只变文字不变布局（高度抖动会让底部按钮点不中）。
+        // ⚠️ 这 8 行**不能用 ForEach**：ForEach 按 key 复用子节点，key 不变就不会重建，
+        //    文本会冻结在首次渲染的值上（真机实测：得关掉小窗再打开才刷新）。
+        //    改为逐行调用 GroupLine(i)，由 @Builder 内部直接读 @State（见该方法注释）。
+        //    行数 8 与 GROUP_DETAIL_LINES 保持一致，改行数时两处一起改。
+        Text(this.groupSummary).fontSize(10.5).fontColor('#FF8FA3B0').width('100%').maxLines(1)
+        Column({ space: 1 }) {
+          this.GroupLine(0)
+          this.GroupLine(1)
+          this.GroupLine(2)
+          this.GroupLine(3)
+          this.GroupLine(4)
+          this.GroupLine(5)
+          this.GroupLine(6)
+          this.GroupLine(7)
         }
-        if (this.groupLines.length > 0) {
-          Column({ space: 1 }) {
-            ForEach(this.groupLines, (line: string, i: number) => {
-              Text(line).fontSize(10.5).fontColor('#FFCBD8E2').width('100%').maxLines(1)
-            }, (line: string, i: number) => `g${i}-${line}`)
-          }
-          .width('100%')
-          .margin({ top: 2, bottom: 2 })
-        }
+        .width('100%')
+        .margin({ top: 2, bottom: 2 })
         Row() {
           Text('单步耗时').fontSize(12).fontColor('#FF9FB0BD')
           Blank()
@@ -1012,7 +1311,8 @@ export struct ScenePage {
       } else {
         this.StatRow('仿真状态', this.connState === 1 ? '载入中…' : '未开启（控制栏→仿真）')
       }
-      this.StatRow('脑规模', '13.9万神经元 · 270万突触')
+      this.StatRow('脑规模', this.brainScale === '' ? '开启仿真后读取' : this.brainScale)
+      this.StatRow('数据集', this.datasetName === '' ? '开启仿真后读取' : this.datasetName)
 
       // 整行可点（onClick 挂在撑满宽度的 Row 上，而不是只挂在文字上 ——
       // 文字自身的命中区太小、实测注入点击容易打空，见易错总结第 26 条）
@@ -1057,7 +1357,29 @@ export struct ScenePage {
                     const dy = event.offsetY - this.panLast.y;
                     this.panLast.x = event.offsetX;
                     this.panLast.y = event.offsetY;
+                    // 双指落下后不平移视角（交给双指平移/捏合），只同步基准值，
+                    // 这样松掉一根手指回到单指时不会因为基准陈旧而跳一下
+                    if (event.fingerList.length > 1) {
+                      return;
+                    }
                     this.sceneMgr.orbitByPixels(dx, dy);
+                  }),
+                // 双指拖拽 → 平移视角（单指旋转 / 双指平移 + 捏合缩放，是 3D 观察器的通行操作）
+                PanGesture({ fingers: 2, distance: 1 })
+                  .onActionStart((event: GestureEvent) => {
+                    this.panTwoLast.x = event.offsetX;
+                    this.panTwoLast.y = event.offsetY;
+                  })
+                  .onActionUpdate((event: GestureEvent) => {
+                    const dx = event.offsetX - this.panTwoLast.x;
+                    const dy = event.offsetY - this.panTwoLast.y;
+                    this.panTwoLast.x = event.offsetX;
+                    this.panTwoLast.y = event.offsetY;
+                    // 捏合缩放进行中不平移（两指距离变化时也会带出位移，避免"缩放顺手把镜头带跑"）
+                    if (this.pinchFingers) {
+                      return;
+                    }
+                    this.sceneMgr.panByPixels(dx, dy, this.areaH);
                   }),
                 PinchGesture({ fingers: 2 })
                   .onActionStart(() => {
@@ -1140,7 +1462,7 @@ export struct ScenePage {
       // 注：不再有全屏遮罩——面板展开时 3D 视角拖拽保持可用，面板仅经分类按钮开合
       Column() {
         Row({ space: 8 }) {
-          Text('果蝇大脑')
+          Text('赛博果蝇')
             .fontSize(19).fontWeight(FontWeight.Bold).fontColor('#FFFFFFFF')
           Blank()
           // 大脑徽章（含运行指示点）

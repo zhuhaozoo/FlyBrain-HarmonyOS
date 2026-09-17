@@ -106,16 +106,36 @@ SOFTWARE.
 
 ## 3. 本项目自有资产
 
-以下资产由本仓库自带的零依赖 Node 脚本**程序化生成**，为项目自有资产，不含第三方版权素材：
+以下资产由本仓库自带的零依赖 Node 脚本**程序化生成**：
 
 | 文件 | 生成脚本 |
 |---|---|
-| `entry/src/main/resources/rawfile/gltf/world.glb` | `tools/gen_world_glb.mjs` |
+| `entry/src/main/resources/rawfile/gltf/world.glb`（果蝇、青蛙、河流、天空等） | `tools/gen_world_glb.mjs` |
 | `entry/src/main/resources/rawfile/gltf/brain.glb` | `tools/gen_brain_glb.mjs`（数据仍受 2.1 约束） |
+
+其中 `world.glb` 内的**树木、岩石、草丛几何**导入自第三方 CC0 素材（见第 5 节），
+其余部分（果蝇、青蛙、河流、天空、日月星辰、特效）为程序化生成，属项目自有资产。
 
 ---
 
-## 4. 依赖的开源库
+## 4. 第三方场景素材（CC0 1.0 公有领域）
+
+`world.glb` 中树木 ×3、岩石与卵石、草丛的网格几何导入自 Quaternius
+「Ultimate Stylized Nature」系列低多边形模型，许可为 **CC0 1.0（公有领域）**：
+允许任意商用、修改、再分发，无需署名。源文件存于 `tools/assets/`
+（明细与来源链接见该目录的 `LICENSE-README.md`），仅作生成期几何来源，不打包进 HAP，
+素材贴图不随应用分发。
+
+v6 起新增的静态配景（花 / 蘑菇 / 灌木 / 倒木 / 芦苇等）几何导入自 Kenney
+「Nature Kit」低多边形素材包，许可同为 **CC0 1.0（公有领域）**，同样只在生成期参与建模。
+
+- 作者：Quaternius（https://quaternius.com ，模型页 https://poly.pizza/u/Quaternius ）
+- 作者：Kenney（https://kenney.nl ，素材页 https://kenney.nl/assets/nature-kit ）
+- 许可原文：https://creativecommons.org/publicdomain/zero/1.0/
+
+---
+
+## 5. 依赖的开源库
 
 | 库 | 用途 | 许可 |
 |---|---|---|

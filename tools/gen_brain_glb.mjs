@@ -1,9 +1,12 @@
-// M2：FlyWire 真实连接组坐标 → 3D 大脑点云 glb 生成脚本（零依赖 Node >= 18）
-// 输入：tools/data/coordinates.csv（已解压）、tools/data/classification.csv（已解压）
+// M2：真实连接组坐标 → 3D 大脑点云 glb 生成脚本（零依赖 Node >= 18）
+// 输入：<data>/coordinates.csv + <data>/classification.csv（与旧 FlyWire 四件套同构；
+//       MaleCNS 升级后由 build_connectome_malecns.mjs 产出 *_app.csv 同格式文件）
 // 输出：entry/src/main/resources/rawfile/gltf/brain.glb
+//       entry/src/main/resources/rawfile/gltf/brain_mini.glb（1/4 抽稀，小窗实时演示用）
+//       entry/src/main/ets/behavior/BrainGroups.ets（点云 5 分组表，BrainPage 表驱动消费）
 // 结构：按 super_class 分 5 组（optic/sensory/central/motor/endocrine），
 //       每个神经元一个小三角形，同组共享材质（自发光），节点可独立显隐。
-// 运行：node tools/gen_brain_glb.mjs
+// 运行：node tools/gen_brain_glb.mjs [--data tools/data] [--label "数据集中文名"]
 //
 // v2 修正（都是真机/解析验证出来的问题）：
 //   1. emissiveFactor 原来被写进了 pbrMetallicRoughness 内部 —— 按 glTF 规范它属于
@@ -11,17 +14,34 @@
 //   2. 原来所有三角形的法线都写死 (0,1,0)，配合平行光会让背光的一半神经元发黑。
 //      现在每个神经元的小三角**朝向背离脑中心**（法线取径向），点云读起来才有体积感；
 //   3. 顺带按位置做轻微尺寸/朝向扰动，避免"整齐的方阵"观感。
-import { writeFileSync, readFileSync, mkdirSync } from 'node:fs';
+import { writeFileSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
-const DIR = join(dirname(fileURLToPath(import.meta.url)), 'data');
-const OUT_FILE = join(dirname(fileURLToPath(import.meta.url)),
-  '..', 'entry', 'src', 'main', 'resources', 'rawfile', 'gltf', 'brain.glb');
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+const GLTF_DIR = join(ROOT, 'entry', 'src', 'main', 'resources', 'rawfile', 'gltf');
+const OUT_FILE = join(GLTF_DIR, 'brain.glb');
+const OUT_MINI = join(GLTF_DIR, 'brain_mini.glb');
+const OUT_GROUPS_ETS = join(ROOT, 'entry', 'src', 'main', 'ets', 'behavior', 'BrainGroups.ets');
+
+const argv = process.argv.slice(2);
+let DIR = join(dirname(fileURLToPath(import.meta.url)), 'data');
+let DATASET_LABEL = 'FAFB 雌性全脑 (FlyWire 2024)';
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === '--data') DIR = argv[++i];
+  else if (argv[i] === '--label') DATASET_LABEL = argv[++i];
+}
 
 // ---------- 读分类 ----------
+// MaleCNS 管线产出 classification_app.csv / coordinates_app.csv（与旧四件套同构），
+// 两个名字都接受，legacy 数据优先用原名。
+function dataFile(base) {
+  const app = join(DIR, `${base}_app.csv`);
+  if (existsSync(app)) return app;
+  return join(DIR, `${base}.csv`);
+}
 console.log('reading classification...');
-const clsLines = readFileSync(join(DIR, 'classification.csv'), 'utf8').split('\n');
+const clsLines = readFileSync(dataFile('classification'), 'utf8').split('\n');
 const groupOf = new Map(); // root_id -> group index
 const GROUPS = ['optic', 'sensory', 'central', 'motor', 'endocrine'];
 let unknown = 0;
@@ -45,7 +65,7 @@ console.log(`classified neurons: ${groupOf.size}, unknown->central: ${unknown}`)
 
 // ---------- 读坐标（每个 root_id 取第一行）----------
 console.log('reading coordinates...');
-const coordLines = readFileSync(join(DIR, 'coordinates.csv'), 'utf8').split('\n');
+const coordLines = readFileSync(dataFile('coordinates'), 'utf8').split('\n');
 const posOf = new Map(); // root_id -> [x,y,z]
 for (let i = 1; i < coordLines.length; i++) {
   const line = coordLines[i].trim();
@@ -262,7 +282,151 @@ for (const m of check.meshes) triTotal += check.accessors[m.primitives[0].indice
 if (triTotal !== NEURON_TOTAL) {
   throw new Error(`三角形数 ${triTotal} 与神经元数 ${NEURON_TOTAL} 不一致（应当一神经元一面）`);
 }
-if (NEURON_TOTAL < 139000) throw new Error(`神经元总数 ${NEURON_TOTAL} 偏低，数据可能没读全`);
+if (NEURON_TOTAL < 100000) throw new Error(`神经元总数 ${NEURON_TOTAL} 偏低，数据可能没读全`);
 
 console.log(`brain.glb OK: ${total} bytes, groups=${GROUPS.length}, neurons=${NEURON_TOTAL}, triangles=${triTotal}`);
 console.log('out:', OUT_FILE);
+
+// ---------- 脑区分组表（BrainPage 表驱动消费）----------
+const GROUP_ZH = { optic: '视觉', sensory: '感觉', central: '中央', motor: '运动', endocrine: '内分泌' };
+const groupRows = GROUPS.map((g) =>
+  `  { zh: '${GROUP_ZH[g]}', node: 'brain_${g}', count: ${byGroup[GROUPS.indexOf(g)].length} },`);
+const groupsEts = `// 自动生成：node tools/gen_brain_glb.mjs（${DATASET_LABEL}）—— 请勿手工编辑
+// 点云 5 分组表：BrainPage 的图例与显隐目标都来自这里（计数 = 实际参与渲染的神经元数）
+export interface BrainGroupRow {
+  zh: string;
+  node: string;
+  count: number;
+}
+
+export const BRAIN_DATASET_LABEL: string = '${DATASET_LABEL}';
+
+export const BRAIN_GROUPS: BrainGroupRow[] = [
+${groupRows.join('\n')}
+];
+`;
+writeFileSync(OUT_GROUPS_ETS, groupsEts);
+console.log(`BrainGroups.ets OK → ${OUT_GROUPS_ETS}`);
+
+// ---------- 迷你版（M5：大脑状态小窗的实时演示）----------
+// 每 MINI_STRIDE 取 1 个神经元，每个脑区两套材质：dim（暗色底）+ hi（高亮色），
+// 两个节点共享同一份 mesh；运行时按"该脑区放电率"切换 dim/hi 的可见性。
+// 抽稀 + 无光纯自发光，保证不拖累主场景帧率。
+const MINI_STRIDE = 4;
+
+const miniMeshes = [];
+for (let g = 0; g < GROUPS.length; g++) {
+  const src = meshes[g].geo;
+  const geo = new Geometry();
+  for (let i = 0; i < src.indices.length; i += 3 * MINI_STRIDE) {
+    const b = src.indices[i];   // 该三角形的第一个顶点（源网格每神经元 3 顶点顺序排列）
+    for (let k = 0; k < 3; k++) {
+      geo.positions.push(src.positions[b * 3 + k * 3], src.positions[b * 3 + k * 3 + 1], src.positions[b * 3 + k * 3 + 2]);
+      geo.normals.push(src.normals[b * 3 + k * 3], src.normals[b * 3 + k * 3 + 1], src.normals[b * 3 + k * 3 + 2]);
+    }
+    geo.indices.push(geo.positions.length / 3 - 3, geo.positions.length / 3 - 2, geo.positions.length / 3 - 1);
+  }
+  if (geo.indices.length === 0) throw new Error(`mini 脑区 ${GROUPS[g]} 抽稀后为空`);
+  miniMeshes.push({ geo, group: g });
+  console.log(`mini ${GROUPS[g]}: neurons=${geo.indices.length / 3}`);
+}
+
+const miniAccessors = [], miniViews = [], miniParts = [];
+let miniOffset = 0;
+function miniPush(typedArr, target) {
+  const padding = pad4(miniOffset);
+  if (padding) miniParts.push(Buffer.alloc(padding));
+  miniOffset += padding;
+  let totalBytes = 0;
+  for (const p of miniParts) totalBytes += p.length;
+  miniParts.push(Buffer.from(typedArr.buffer, typedArr.byteOffset, typedArr.byteLength));
+  miniViews.push({ buffer: 0, byteOffset: totalBytes, byteLength: typedArr.byteLength, target });
+  miniOffset = totalBytes + typedArr.byteLength;
+  return miniViews.length - 1;
+}
+function miniAccessor(arr, type, comp, target) {
+  const view = miniPush(arr, target);
+  miniAccessors.push({ bufferView: view, componentType: comp, count: arr.length / (type === 'VEC3' ? 3 : 1), type });
+  return miniAccessors.length - 1;
+}
+
+const miniGltfMeshes = [];
+for (const m of miniMeshes) {
+  const pos = floatArr(m.geo.positions);
+  const nor = floatArr(m.geo.normals);
+  let mn = [1e9, 1e9, 1e9], mx = [-1e9, -1e9, -1e9];
+  for (let i = 0; i < pos.length; i += 3) {
+    for (let k = 0; k < 3; k++) {
+      if (pos[i + k] < mn[k]) mn[k] = pos[i + k];
+      if (pos[i + k] > mx[k]) mx[k] = pos[i + k];
+    }
+  }
+  const big = pos.length / 3 > 65535;
+  const idx = indexArr(m.geo.indices, big);
+  const posAcc = miniAccessor(pos, 'VEC3', 5126, 34962, { min: mn, max: mx });
+  const norAcc = miniAccessor(nor, 'VEC3', 5126, 34962);
+  const idxAcc = miniAccessor(idx, 'SCALAR', big ? 5125 : 5123, 34963);
+  miniGltfMeshes.push({
+    primitives: [{ attributes: { POSITION: posAcc, NORMAL: norAcc }, indices: idxAcc, material: m.group }],
+  });
+}
+
+// mini 材质：前 5 个是 dim（暗灰微光，未活跃），后 5 个是 hi（脑区本色高亮，活跃时显示）
+const miniMaterials = [
+  { name: 'dim', base: srgb(0x2a3138), emis: [0.045, 0.055, 0.07] },
+  ...materials.map((m) => ({ name: `hi_${m.name}`, base: m.base, emis: m.emis.map((v) => v * 1.15) })),
+];
+const miniNodes = [];
+for (let g = 0; g < GROUPS.length; g++) {
+  miniNodes.push({ name: `mini_dim_${g}`, mesh: g });
+}
+for (let g = 0; g < GROUPS.length; g++) {
+  miniNodes.push({ name: `mini_hi_${g}`, mesh: g });
+}
+const miniGltf = {
+  asset: { version: '2.0', generator: `guoying gen_brain_glb.mjs (${DATASET_LABEL}; mini live demo)` },
+  scene: 0,
+  scenes: [{ name: 'brain_mini', nodes: miniNodes.map((_, i) => i) }],
+  nodes: miniNodes,
+  meshes: miniGltfMeshes,
+  materials: miniMaterials.map((m) => ({
+    name: m.name,
+    doubleSided: true,
+    emissiveFactor: m.emis,
+    pbrMetallicRoughness: { baseColorFactor: m.base, metallicFactor: 0, roughnessFactor: 0.85 },
+  })),
+  accessors: miniAccessors,
+  bufferViews: miniViews,
+  buffers: [{ byteLength: miniOffset }],
+};
+
+// JSON chunk 按 glTF 规范用 0x20 填充（JSON.parse 容忍尾部空格，自校验可直接解析）；
+// 二进制 chunk 用 0x00 填充。
+const padMini = (b, byte = 0) => { const p = pad4(b.length); return p ? Buffer.concat([b, Buffer.alloc(p, byte)]) : b; };
+const miniJson = padMini(Buffer.from(JSON.stringify(miniGltf), 'utf8'), 0x20);
+const miniBin = padMini(Buffer.concat(miniParts));
+const miniTotal = 12 + 8 + miniJson.length + 8 + miniBin.length;
+const miniHeader = Buffer.alloc(12);
+miniHeader.writeUInt32LE(0x46546C67, 0); miniHeader.writeUInt32LE(2, 4); miniHeader.writeUInt32LE(miniTotal, 8);
+const mjh = Buffer.alloc(8); mjh.writeUInt32LE(miniJson.length, 0); mjh.writeUInt32LE(0x4E4F534A, 4);
+const mbh = Buffer.alloc(8); mbh.writeUInt32LE(miniBin.length, 0); mbh.writeUInt32LE(0x004E4942, 4);
+writeFileSync(OUT_MINI, Buffer.concat([miniHeader, mjh, miniJson, mbh, miniBin]));
+
+// mini 自校验（节点契约：mini_dim_0..4 / mini_hi_0..4，运行时按名字切换可见性）
+const mcheck = JSON.parse(miniJson.toString('utf8'));
+const mbufLen = mcheck.buffers[0].byteLength;
+for (const a of mcheck.accessors) {
+  const v = mcheck.bufferViews[a.bufferView];
+  if (v.byteOffset + v.byteLength > mbufLen) throw new Error('mini bufferView overflow');
+  if (a.count <= 0) throw new Error('mini 存在 count=0 的 accessor');
+}
+const mNames = mcheck.nodes.map((n) => n.name);
+for (let g = 0; g < GROUPS.length; g++) {
+  if (!mNames.includes(`mini_dim_${g}`) || !mNames.includes(`mini_hi_${g}`)) {
+    throw new Error(`mini 缺少脑区节点 ${g}`);
+  }
+}
+let miniTris = 0;
+for (const m of mcheck.meshes) miniTris += mcheck.accessors[m.primitives[0].indices].count / 3;
+console.log(`brain_mini.glb OK: ${miniTotal} bytes, neurons≈${miniTris}, nodes=${mNames.length}`);
+console.log('out:', OUT_MINI);

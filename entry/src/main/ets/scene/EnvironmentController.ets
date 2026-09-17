@@ -31,14 +31,15 @@ const LIT_FRAC = 0.74;
 // 3 棵树的摆动相位偏移（错开，避免整齐划一地摆）
 const TREE_PHASE: number[] = [0, 2.1, 4.2];
 // 6 条风线各自的车道（z 偏移）与起始延迟
-const WIND_LANE_Z: number[] = [-2.1, -1.3, -0.5, 0.3, 1.1, 1.9];
+// v6：场地放大 1.5 倍 → 车道由 ±2.1 扩到 ±4.5（间距 1.8），否则风线全挤在场心一条窄带里
+const WIND_LANE_Z: number[] = [-4.5, -2.7, -0.9, 0.9, 2.7, 4.5];
 const WIND_DELAY: number[] = [0, 0.10, 0.20, 0.30, 0.40, 0.50];
-// 3 个涟漪在河流弧上的角度（落在弧带中段，靠近活动区一侧）与延迟
-const RIPPLE_ANGLE: number[] = [38 * DEG, 62 * DEG, 86 * DEG];
+// 3 个涟漪在蜿蜒河道中心线上（v7：与 FlyConfig.riverPts 同源的采样点，落在水带中段）
+const RIPPLE_PTS: number[][] = [[-3.2, -2.6], [1.267, 0.993], [6.4, 2.963]];
 const RIPPLE_DELAY: number[] = [0, 0.25, 0.50];
-const RIPPLE_RADIUS = 5.6;   // 落在水带中间
 
-const WIND_LINE_DURATION = 0.9;   // 单条风线横穿耗时
+// v6：横扫距离由 10.4 扩到 15.6，时长同比 0.9 → 1.35，保持风线"看得清在飞"的速度感
+const WIND_LINE_DURATION = 1.35;  // 单条风线横穿耗时
 const RIPPLE_DURATION = 1.2;      // 单个涟漪扩散耗时
 
 export class EnvironmentController {
@@ -52,7 +53,7 @@ export class EnvironmentController {
   private baseIntensity: number = -1;
   private gustT: number = -1;        // 本次阵风已进行的时间（<0 表示无阵风）
   private lastWind: number = 0;
-  private riverY: number = 0.012;    // 河面基准高度（与生成脚本一致）
+  private riverY: number = 0.028;    // 河面基准高度（v7.1：与生成脚本主水面 0.028 成对）
   private curSeg: number = 0;        // 当前所在关键帧区间（每帧算一次）
   private curK: number = 0;          // 区间内进度 0..1
   private deathDim: number = 1.0;    // 果蝇死亡时整体压暗（×0.9）
@@ -255,15 +256,15 @@ export class EnvironmentController {
       }
       line.visible = true;
       line.position = {
-        x: 5.2 - 10.4 * p,
+        x: 7.8 - 15.6 * p,   // v6：横扫范围 ±7.8（覆盖放大后的全场，不再只盖中心）
         y: 0.55 + 0.35 * WIND_LANE_Z[i] * 0.2 + 0.05 * Math.sin(p * Math.PI),
         z: WIND_LANE_Z[i],
       };
       line.rotation = quatY(Math.PI / 2); // 长边沿 X 轴
     }
 
-    // 涟漪：从河流弧上向外扩散
-    for (let i = 0; i < RIPPLE_ANGLE.length; i++) {
+    // 涟漪：从河道水面上扩散（v7：位置取蜿蜒河道中心线上的固定采样点）
+    for (let i = 0; i < RIPPLE_PTS.length; i++) {
       const ring = this.getNode(`ripple_${i}`);
       if (!ring) {
         continue;
@@ -276,9 +277,9 @@ export class EnvironmentController {
       ring.visible = true;
       const s = 0.35 + 1.5 * p;
       ring.position = {
-        x: RIPPLE_RADIUS * Math.cos(RIPPLE_ANGLE[i]),
+        x: RIPPLE_PTS[i][0],
         y: this.riverY + 0.006,
-        z: RIPPLE_RADIUS * Math.sin(RIPPLE_ANGLE[i]),
+        z: RIPPLE_PTS[i][1],
       };
       ring.scale = { x: s, y: 1, z: s };
     }

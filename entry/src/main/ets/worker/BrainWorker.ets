@@ -13,6 +13,7 @@
 //                     setStimulusState{indices,intensities} / stimulate{indices,intensities}
 //   Worker -> 主线程: ready{N,edges} / tick{groupSpikes,fired} / stats{...} / error{msg}
 import { worker, ThreadWorkerGlobalScope, MessageEvents } from '@kit.ArkTS';
+import { fileIo as fs } from '@kit.CoreFileKit';
 
 const workerPort: ThreadWorkerGlobalScope = worker.workerPort;
 
@@ -53,7 +54,9 @@ let firedSum = 0;
 
 interface InitMessage {
   type: string;
-  buffer: ArrayBuffer;
+  fd: number;
+  offset: number;
+  length: number;
 }
 interface StimMessage {
   type: string;
@@ -314,13 +317,37 @@ function tick(): void {
   }
 }
 
+// 分块读取 rawfile（fs.readSync 只接受纯 ArrayBuffer，传 Uint8Array 视图报 EINVAL）。
+// 注意：fd 是全进程共享的（多个 BrainWorker 用同一个），不在这里 close。
+function nmfReadRawFile(fd: number, offset: number, length: number): ArrayBuffer {
+  const buf = new ArrayBuffer(length);
+  const dst = new Uint8Array(buf);
+  let done = 0;
+  const chunk = 4 * 1024 * 1024;
+  while (done < length) {
+    const n = Math.min(chunk, length - done);
+    const chunkBuf = new ArrayBuffer(n);
+    const got = fs.readSync(fd, chunkBuf, { offset: offset + done, length: n });
+    if (got <= 0) {
+      throw new Error('rawfile read short: ' + done + '/' + length);
+    }
+    dst.set(new Uint8Array(chunkBuf, 0, got), done);
+    done += got;
+  }
+  return buf;
+}
+
 workerPort.onmessage = (e: MessageEvents) => {
   const msg = e.data as InitMessage | StimMessage;
   const t = msg.type;
   if (t === 'init') {
     try {
-      const buf = (msg as InitMessage).buffer;
-      parseBinary(buf);
+      // v7.1：rawfile 读取在 Worker 线程分块进行（主线程只传 fd/offset/length）。
+      // 完整连接组 2500 万边时读取缓冲约 310MB —— 把读取封装成独立函数并内联传参，
+      // parseBinary 返回后大 buffer 即可达回收条件，显著降低 buildGroupStructures
+      // 二次重排（新旧 CSR 并存）时的内存峰值。
+      const im = msg as InitMessage;
+      parseBinary(nmfReadRawFile(im.fd, im.offset, im.length));
       buildGroupStructures();
       console.info(`[FlyBrain-W] ready N=${N} edges=${edgeCount} groups=${numGroups}`);
       workerPort.postMessage({ type: 'ready', neurons: N, edges: edgeCount, groups: numGroups });

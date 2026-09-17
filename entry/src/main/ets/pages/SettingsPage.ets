@@ -10,6 +10,8 @@ export struct SettingsPage {
   @State private speed: number = flyConfig.speedScale;
   @State private dayNight: boolean = flyConfig.dayNightEnabled;
   @State private frogOn: boolean = flyConfig.frogEnabled;
+  @State private agentCount: number = flyConfig.agentCount;
+  @State private connFull: boolean = flyConfig.connFull;   // false=Lite（默认）
   private store: preferences.Preferences | null = null;
 
   aboutToAppear(): void {
@@ -24,8 +26,14 @@ export struct SettingsPage {
       }
       this.dayNight = store.getSync('dayNight', flyConfig.dayNightEnabled) as boolean;
       this.frogOn = store.getSync('frogEnabled', flyConfig.frogEnabled) as boolean;
+      const savedCount = store.getSync('agentCount', flyConfig.agentCount) as number;
+      if (savedCount >= 1 && savedCount <= 6) {
+        this.agentCount = Math.round(savedCount);
+      }
       flyConfig.dayNightEnabled = this.dayNight;
       flyConfig.frogEnabled = this.frogOn;
+      flyConfig.agentCount = this.agentCount;
+
     } catch (err) {
       console.warn(`[FlyBrain] load prefs failed: ${JSON.stringify(err)}`);
     }
@@ -136,6 +144,64 @@ export struct SettingsPage {
             }
             .width('100%')
             .padding({ top: 10, bottom: 10 })
+
+            Divider().color($r('app.color.fy_divider'))
+
+            // M5：同屏果蝇数量（模型已烘焙 6 份，这里决定上场几只）
+            Row() {
+              Text('同屏果蝇').fontSize(15).fontColor($r('app.color.fy_text_primary')).layoutWeight(1)
+              Row({ space: 6 }) {
+                ForEach([1, 3, 6], (n: number) => {
+                  Button(`${n}`)
+                    .fontSize(13).height(30).width(40)
+                    .backgroundColor(this.agentCount === n ? $r('app.color.fy_accent') : '#33262630')
+                    .fontColor(this.agentCount === n ? '#FFFFFFFF' : $r('app.color.fy_text_secondary'))
+                    .onClick(() => {
+                      this.agentCount = n;
+                      flyConfig.agentCount = n;
+                      this.persist('agentCount', n);
+                    })
+                }, (n: number) => n.toString())
+              }
+            }
+            .width('100%')
+            .padding({ top: 10, bottom: 10 })
+
+            Divider().color($r('app.color.fy_divider'))
+
+            // 连接组模式（v7.2）：Lite=瘦身 400 万边（默认）；全仿真=2556 万边完整连接组
+            Column({ space: 2 }) {
+              Text('连接组模式').fontSize(15).fontColor($r('app.color.fy_text_primary'))
+              Text('Lite：瘦身 400 万边（默认，省内存省电）· 全仿真：2556 万边完整连接组' +
+                '（多耗约 600MB 内存，')
+                .fontSize(11).fontColor($r('app.color.fy_text_tertiary'))
+            }
+            .alignItems(HorizontalAlign.Start)
+            .width('100%')
+            .padding({ top: 10, bottom: 4 })
+
+            Row({ space: 6 }) {
+              Button('Lite（默认）')
+                .fontSize(13).height(34).layoutWeight(1)
+                .backgroundColor(!this.connFull ? $r('app.color.fy_accent') : '#33262630')
+                .fontColor(!this.connFull ? '#FFFFFFFF' : $r('app.color.fy_text_secondary'))
+                .onClick(() => {
+                  this.connFull = false;
+                  flyConfig.connFull = false;
+
+                })
+              Button('全仿真')
+                .fontSize(13).height(34).layoutWeight(1)
+                .backgroundColor(this.connFull ? $r('app.color.fy_accent') : '#33262630')
+                .fontColor(this.connFull ? '#FFFFFFFF' : $r('app.color.fy_text_secondary'))
+                .onClick(() => {
+                  this.connFull = true;
+                  flyConfig.connFull = true;
+
+                })
+            }
+            .width('100%')
+            .padding({ top: 4, bottom: 10 })
           }
           .width('100%')
           .padding(12)
@@ -168,7 +234,7 @@ export struct SettingsPage {
           .borderRadius(12)
           .backgroundColor($r('app.color.fy_card_bg'))
         }
-        .padding({ left: 16, right: 16, bottom: 24 })
+        .padding({ top:90,left: 16, right: 16, bottom: 24 })
       }
         .layoutWeight(1)
         .width('100%')
